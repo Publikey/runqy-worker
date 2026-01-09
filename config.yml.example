@@ -1,0 +1,94 @@
+# runqy-worker configuration
+# Copy this file to config.yml and adjust as needed
+
+redis:
+  addr: "${REDIS_URL:-localhost:6379}"
+  password: "${REDIS_PASSWORD}"
+  db: 0
+  tls: false
+
+worker:
+  concurrency: 4
+  shutdown_timeout: 30s
+
+retry:
+  max_retry: 5
+
+# Default settings for all HTTP handlers
+defaults:
+  http:
+    timeout: 30s
+    retry_on: [429, 500, 502, 503, 504]
+    fail_on: [400, 422]
+    headers:
+      Content-Type: "application/json"
+
+# Queue definitions with handlers
+# Each queue has:
+#   - priority: Weight for processing (higher = more priority)
+#   - handler: HTTP endpoint to POST tasks to
+#
+# The handler receives a POST request with JSON body:
+# {
+#   "task_id": "abc123",
+#   "type": "email:send",
+#   "payload": { ... },
+#   "payload_raw": "base64...",
+#   "retry_count": 0,
+#   "max_retry": 5,
+#   "queue": "default"
+# }
+queues:
+  # High priority queue - process 6x more often
+  critical:
+    priority: 6
+    handler:
+      url: "http://localhost:8080/webhooks/tasks"
+      timeout: 60s
+      headers:
+        X-Webhook-Secret: "${WEBHOOK_SECRET}"
+
+  # Normal priority queue
+  default:
+    priority: 3
+    handler:
+      url: "http://localhost:8080/webhooks/tasks"
+
+  # Low priority queue - background jobs
+  low:
+    priority: 1
+    handler:
+      url: "http://localhost:8080/webhooks/tasks"
+
+# Example: Different handlers per queue
+# queues:
+#   emails:
+#     priority: 5
+#     handler:
+#       url: "http://localhost:8080/webhooks/email"
+#       timeout: 60s
+#
+#   reports:
+#     priority: 2
+#     handler:
+#       url: "http://localhost:8080/webhooks/reports"
+#       timeout: 5m
+#       auth:
+#         type: bearer
+#         token: "${REPORT_API_TOKEN}"
+#
+#   notifications:
+#     priority: 3
+#     handler:
+#       url: "https://api.pushservice.com/send"
+#       auth:
+#         type: api_key
+#         header: "X-API-Key"
+#         key: "${PUSH_API_KEY}"
+
+# Example: Debug queue that just logs tasks
+# queues:
+#   debug:
+#     priority: 1
+#     handler:
+#       type: log

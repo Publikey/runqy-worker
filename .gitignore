@@ -1,0 +1,30 @@
+# Config with secrets
+config.yml
+
+# Go binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Go coverage
+*.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.claude/
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+
