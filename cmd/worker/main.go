@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	worker "github.com/publikey/runqy-worker"
 )
@@ -28,6 +31,9 @@ func main() {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	// Set version for bootstrap registration
+	cfg.Version = Version
+
 	if *validate {
 		if err := validateConfig(cfg); err != nil {
 			log.Fatalf("Configuration error: %v", err)
@@ -36,82 +42,55 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Create worker
-	w := worker.New(*cfg)
-
-	// Register queue handlers from config
-	handlerCount := 0
-	for queueName, handlerCfg := range cfg.QueueHandlers {
-		handler, err := worker.NewHandlerFromConfig(handlerCfg, cfg.Defaults, cfg.Logger)
-		if err != nil {
-			log.Fatalf("Failed to create handler for queue %q: %v", queueName, err)
-		}
-		w.HandleQueue(queueName, handler)
-		handlerCount++
-		log.Printf("Registered handler: queue=%s -> %s", queueName, describeHandler(handlerCfg))
+	// Validate config
+	if err := validateConfig(cfg); err != nil {
+		log.Fatalf("Configuration error: %v", err)
 	}
 
-	if handlerCount == 0 {
-		log.Fatal("No handlers configured. Add handler to each queue in config.yml")
+	// Create worker with minimal config
+	w := worker.New(*cfg)
+
+	// Bootstrap: contact server, deploy code, start Python process
+	log.Printf("Starting runqy-worker %s...", Version)
+	log.Printf("  Server: %s", cfg.ServerURL)
+	log.Printf("  Queue: %s", cfg.Queue)
+	log.Printf("  Concurrency: %d", cfg.Concurrency)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle interrupt during bootstrap
+	go func() {
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+		<-quit
+		log.Println("Interrupt received, cancelling bootstrap...")
+		cancel()
+	}()
+
+	if err := w.Bootstrap(ctx); err != nil {
+		log.Fatalf("Bootstrap failed: %v", err)
 	}
 
 	// Run worker (blocks until SIGTERM/SIGINT)
-	log.Printf("Starting runqy-worker %s...", Version)
-	log.Printf("  Redis: %s", cfg.RedisAddr)
-	log.Printf("  Concurrency: %d", cfg.Concurrency)
-	log.Printf("  Queues: %v", cfg.Queues)
-
 	if err := w.Run(); err != nil {
 		log.Fatalf("Worker error: %v", err)
 	}
 }
 
-// validateConfig validates the configuration.
+// validateConfig validates the configuration for bootstrap mode.
 func validateConfig(cfg *worker.Config) error {
-	if cfg.RedisAddr == "" {
-		return fmt.Errorf("redis.addr is required")
+	if cfg.ServerURL == "" {
+		return fmt.Errorf("server.url is required")
 	}
-	if len(cfg.Queues) == 0 {
-		return fmt.Errorf("at least one queue is required")
+	if cfg.APIKey == "" {
+		return fmt.Errorf("server.api_key is required")
 	}
-
-	// Check that each queue has a handler
-	for queueName := range cfg.Queues {
-		handlerCfg, ok := cfg.QueueHandlers[queueName]
-		if !ok || handlerCfg == nil {
-			return fmt.Errorf("queue %q has no handler configured", queueName)
-		}
-
-		handlerType := handlerCfg.Type
-		if handlerType == "" {
-			handlerType = "http"
-		}
-
-		if handlerType == "http" && handlerCfg.URL == "" {
-			return fmt.Errorf("queue %q: http handler requires url", queueName)
-		}
+	if cfg.Queue == "" {
+		return fmt.Errorf("worker.queue is required")
 	}
-
+	if cfg.Concurrency <= 0 {
+		return fmt.Errorf("worker.concurrency must be > 0")
+	}
 	return nil
-}
-
-// describeHandler returns a short description of the handler config.
-func describeHandler(cfg *worker.HandlerConfig) string {
-	handlerType := cfg.Type
-	if handlerType == "" {
-		handlerType = "http"
-	}
-
-	switch handlerType {
-	case "http":
-		method := cfg.Method
-		if method == "" {
-			method = "POST"
-		}
-		return fmt.Sprintf("HTTP %s %s", method, cfg.URL)
-	case "log":
-		return "log"
-	default:
-		return handlerType
-	}
 }

@@ -1,6 +1,9 @@
 # Config with secrets
 config.yml
 
+# Runtime deployment directory
+deployment/
+
 # Go binaries
 *.exe
 *.exe~
@@ -22,6 +25,7 @@ coverage.html
 *.swo
 .claude/
 CLAUDE.md
+*_PLAN.md
 
 # OS
 .DS_Store
