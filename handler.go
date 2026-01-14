@@ -3,6 +3,8 @@ package worker
 import (
 	"context"
 	"fmt"
+
+	"github.com/publikey/runqy-worker/internal/handler"
 )
 
 // Handler processes a task.
@@ -37,23 +39,23 @@ func NewServeMux() *ServeMux {
 }
 
 // Handle registers a handler for the given task type.
-func (mux *ServeMux) Handle(taskType string, handler Handler) {
-	mux.handlers[taskType] = handler
+func (mux *ServeMux) Handle(taskType string, h Handler) {
+	mux.handlers[taskType] = h
 }
 
 // HandleFunc registers a handler function for the given task type.
-func (mux *ServeMux) HandleFunc(taskType string, handler func(ctx context.Context, task *Task) error) {
-	mux.handlers[taskType] = HandlerFunc(handler)
+func (mux *ServeMux) HandleFunc(taskType string, h func(ctx context.Context, task *Task) error) {
+	mux.handlers[taskType] = HandlerFunc(h)
 }
 
 // SetDefault sets the default handler for unregistered task types.
-func (mux *ServeMux) SetDefault(handler Handler) {
-	mux.defaultHandler = handler
+func (mux *ServeMux) SetDefault(h Handler) {
+	mux.defaultHandler = h
 }
 
 // SetDefaultFunc sets the default handler function for unregistered task types.
-func (mux *ServeMux) SetDefaultFunc(handler func(ctx context.Context, task *Task) error) {
-	mux.defaultHandler = HandlerFunc(handler)
+func (mux *ServeMux) SetDefaultFunc(h func(ctx context.Context, task *Task) error) {
+	mux.defaultHandler = HandlerFunc(h)
 }
 
 // Use adds middleware to the mux.
@@ -63,17 +65,16 @@ func (mux *ServeMux) Use(mw MiddlewareFunc) {
 
 // ProcessTask routes the task to the appropriate handler.
 func (mux *ServeMux) ProcessTask(ctx context.Context, task *Task) error {
-	handler, ok := mux.handlers[task.Type()]
+	h, ok := mux.handlers[task.Type()]
 	if !ok {
 		if mux.defaultHandler != nil {
-			handler = mux.defaultHandler
+			h = mux.defaultHandler
 		} else {
 			return fmt.Errorf("no handler registered for task type %q", task.Type())
 		}
 	}
 
 	// Apply middlewares in reverse order (last added = outermost)
-	h := handler
 	for i := len(mux.middlewares) - 1; i >= 0; i-- {
 		h = mux.middlewares[i](h)
 	}
@@ -85,4 +86,65 @@ func (mux *ServeMux) ProcessTask(ctx context.Context, task *Task) error {
 func (mux *ServeMux) HasHandler(taskType string) bool {
 	_, ok := mux.handlers[taskType]
 	return ok
+}
+
+// NewHandlerFromConfig creates a Handler from a HandlerConfig.
+// Uses types from config_yaml.go: HandlerConfig, DefaultsConfig
+func NewHandlerFromConfig(cfg *HandlerConfig, defaults DefaultsConfig, logger Logger) (HandlerFunc, error) {
+	// Convert our config types to internal handler types
+	internalCfg := &handler.HandlerConfig{
+		Type:    cfg.Type,
+		URL:     cfg.URL,
+		Method:  cfg.Method,
+		Timeout: cfg.Timeout,
+		Headers: cfg.Headers,
+		Auth: handler.AuthConfig{
+			Type:     cfg.Auth.Type,
+			Username: cfg.Auth.Username,
+			Password: cfg.Auth.Password,
+			Token:    cfg.Auth.Token,
+			Header:   cfg.Auth.Header,
+			Key:      cfg.Auth.Key,
+		},
+		RetryOn: cfg.RetryOn,
+		FailOn:  cfg.FailOn,
+	}
+
+	internalDefaults := handler.DefaultsConfig{
+		HTTP: handler.HTTPDefaultsConfig{
+			Timeout: defaults.HTTP.Timeout,
+			RetryOn: defaults.HTTP.RetryOn,
+			FailOn:  defaults.HTTP.FailOn,
+			Headers: defaults.HTTP.Headers,
+		},
+	}
+
+	// Create internal handler
+	internalHandler, err := handler.NewHandlerFromConfig(internalCfg, internalDefaults, &loggerAdapter{logger})
+	if err != nil {
+		return nil, err
+	}
+
+	// Wrap it to return our HandlerFunc type
+	return func(ctx context.Context, task *Task) error {
+		return internalHandler(ctx, task)
+	}, nil
+}
+
+// loggerAdapter adapts our Logger (variadic args) to handler.Logger (format + args)
+type loggerAdapter struct {
+	l Logger
+}
+
+func (a *loggerAdapter) Info(format string, args ...interface{}) {
+	a.l.Info(fmt.Sprintf(format, args...))
+}
+func (a *loggerAdapter) Warn(format string, args ...interface{}) {
+	a.l.Warn(fmt.Sprintf(format, args...))
+}
+func (a *loggerAdapter) Error(format string, args ...interface{}) {
+	a.l.Error(fmt.Sprintf(format, args...))
+}
+func (a *loggerAdapter) Debug(format string, args ...interface{}) {
+	a.l.Debug(fmt.Sprintf(format, args...))
 }

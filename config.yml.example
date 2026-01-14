@@ -1,94 +1,93 @@
 # runqy-worker configuration
 # Copy this file to config.yml and adjust as needed
+#
+# BREAKING CHANGE: Workers now bootstrap from a central server.
+# Redis credentials and task handlers are provided by the server.
 
-redis:
-  addr: "${REDIS_URL:-localhost:6379}"
-  password: "${REDIS_PASSWORD}"
-  db: 0
-  tls: false
+# Server connection (required)
+# Worker contacts this server on startup to register and receive configuration
+server:
+  url: "${RUNQY_SERVER_URL}"
+  api_key: "${RUNQY_API_KEY}"
 
+# Worker settings
 worker:
-  concurrency: 4
-  shutdown_timeout: 30s
+  queue: "inference"           # Single queue name to listen on
+  concurrency: 4               # Max parallel tasks
+  shutdown_timeout: 30s        # Time to wait for graceful shutdown
 
+# Bootstrap retry settings (optional)
+# If the server is unavailable, worker will retry before failing
+bootstrap:
+  retries: 3                   # Number of retry attempts (default: 3)
+  retry_delay: "5s"            # Delay between retries (default: 5s)
+
+# Git authentication (optional)
+# Used when cloning private repositories
+git:
+  ssh_key: ""                  # Path to SSH private key file
+  # ssh_key: "/path/to/id_rsa"
+  token: ""                    # Personal access token or password
+  # token: "${GIT_TOKEN}"
+
+# Deployment settings (optional)
+deployment:
+  dir: "./deployment"          # Directory for code deployment (default: ./deployment)
+
+# Retry settings (optional)
 retry:
-  max_retry: 5
+  max_retry: 5                 # Max retry attempts for failed tasks
 
-# Default settings for all HTTP handlers
-defaults:
-  http:
-    timeout: 30s
-    retry_on: [429, 500, 502, 503, 504]
-    fail_on: [400, 422]
-    headers:
-      Content-Type: "application/json"
-
-# Queue definitions with handlers
-# Each queue has:
-#   - priority: Weight for processing (higher = more priority)
-#   - handler: HTTP endpoint to POST tasks to
+# ============================================================================
+# How Bootstrap Works:
+# ============================================================================
 #
-# The handler receives a POST request with JSON body:
+# 1. Worker POSTs to {server.url}/worker/register with:
+#    - queue name
+#    - hostname, OS, version
+#    - Authorization: Bearer {api_key}
+#
+# 2. Server responds with:
+#    - Redis connection credentials
+#    - Queue priority configuration
+#    - Git repository URL and branch to clone
+#    - Startup command for FastAPI process
+#    - Environment variables
+#    - Task type -> endpoint path mappings
+#
+# 3. Worker then:
+#    - Connects to Redis using server-provided credentials
+#    - Clones the git repository (using git.ssh_key or git.token if private)
+#    - Creates Python virtualenv and installs dependencies
+#    - Starts FastAPI process on localhost:8080
+#    - Begins processing tasks, forwarding them to local FastAPI
+#
+# ============================================================================
+# Example Server Response:
+# ============================================================================
+#
 # {
-#   "task_id": "abc123",
-#   "type": "email:send",
-#   "payload": { ... },
-#   "payload_raw": "base64...",
-#   "retry_count": 0,
-#   "max_retry": 5,
-#   "queue": "default"
+#   "redis": {
+#     "addr": "redis.example.com:6379",
+#     "password": "secret",
+#     "db": 0,
+#     "use_tls": true
+#   },
+#   "queue": {
+#     "name": "inference",
+#     "priority": 6
+#   },
+#   "deployment": {
+#     "git_url": "https://github.com/example/inference-service.git",
+#     "branch": "main",
+#     "startup_cmd": "uvicorn app.main:app --host 0.0.0.0 --port 8080",
+#     "env_vars": {
+#       "MODEL_PATH": "/models/gpt"
+#     },
+#     "startup_timeout_secs": 300
+#   },
+#   "routes": {
+#     "inference:predict": "/predict",
+#     "inference:batch": "/batch"
+#   }
 # }
-queues:
-  # High priority queue - process 6x more often
-  critical:
-    priority: 6
-    handler:
-      url: "http://localhost:8080/webhooks/tasks"
-      timeout: 60s
-      headers:
-        X-Webhook-Secret: "${WEBHOOK_SECRET}"
-
-  # Normal priority queue
-  default:
-    priority: 3
-    handler:
-      url: "http://localhost:8080/webhooks/tasks"
-
-  # Low priority queue - background jobs
-  low:
-    priority: 1
-    handler:
-      url: "http://localhost:8080/webhooks/tasks"
-
-# Example: Different handlers per queue
-# queues:
-#   emails:
-#     priority: 5
-#     handler:
-#       url: "http://localhost:8080/webhooks/email"
-#       timeout: 60s
-#
-#   reports:
-#     priority: 2
-#     handler:
-#       url: "http://localhost:8080/webhooks/reports"
-#       timeout: 5m
-#       auth:
-#         type: bearer
-#         token: "${REPORT_API_TOKEN}"
-#
-#   notifications:
-#     priority: 3
-#     handler:
-#       url: "https://api.pushservice.com/send"
-#       auth:
-#         type: api_key
-#         header: "X-API-Key"
-#         key: "${PUSH_API_KEY}"
-
-# Example: Debug queue that just logs tasks
-# queues:
-#   debug:
-#     priority: 1
-#     handler:
-#       type: log

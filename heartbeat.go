@@ -19,21 +19,23 @@ type heartbeat struct {
 	wg         sync.WaitGroup
 	logger     Logger
 	config     Config
+	supervisor *ProcessSupervisor // supervised process (may be nil)
 }
 
 // newHeartbeat creates a new heartbeat sender.
-func newHeartbeat(rdb *redis.Client, cfg Config) *heartbeat {
+func newHeartbeat(rdb *redis.Client, cfg Config, supervisor *ProcessSupervisor) *heartbeat {
 	hostname, _ := os.Hostname()
 	pid := os.Getpid()
 	workerID := fmt.Sprintf("%s:%d", hostname, pid)
 
 	return &heartbeat{
-		rdb:      rdb,
-		workerID: workerID,
-		interval: 5 * time.Second,
-		done:     make(chan struct{}),
-		logger:   cfg.Logger,
-		config:   cfg,
+		rdb:        rdb,
+		workerID:   workerID,
+		interval:   5 * time.Second,
+		done:       make(chan struct{}),
+		logger:     cfg.Logger,
+		config:     cfg,
+		supervisor: supervisor,
 	}
 }
 
@@ -92,6 +94,7 @@ func (h *heartbeat) register(ctx context.Context) {
 		"concurrency": h.config.Concurrency,
 		"queues":      fmt.Sprintf("%v", h.config.Queues),
 		"status":      "running",
+		"healthy":     h.isHealthy(),
 	}
 	h.rdb.HSet(ctx, workerKey, data)
 	h.rdb.Expire(ctx, workerKey, 30*time.Second)
@@ -103,12 +106,24 @@ func (h *heartbeat) register(ctx context.Context) {
 func (h *heartbeat) beat(ctx context.Context) {
 	workerKey := fmt.Sprintf(keyWorkerData, h.workerID)
 	now := time.Now().Unix()
+	healthy := h.isHealthy()
 
-	h.rdb.HSet(ctx, workerKey, "last_beat", now)
+	h.rdb.HSet(ctx, workerKey, map[string]interface{}{
+		"last_beat": now,
+		"healthy":   healthy,
+	})
 	h.rdb.Expire(ctx, workerKey, 30*time.Second)
 
 	// Renew membership in workers set
 	h.rdb.SAdd(ctx, keyWorkers, h.workerID)
+}
+
+// isHealthy returns true if the worker and supervised process are healthy.
+func (h *heartbeat) isHealthy() bool {
+	if h.supervisor == nil {
+		return true // No supervisor = worker-only mode, always healthy
+	}
+	return h.supervisor.IsHealthy()
 }
 
 // deregister removes the worker from the registry.

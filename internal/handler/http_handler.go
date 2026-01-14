@@ -1,4 +1,4 @@
-package worker
+package handler
 
 import (
 	"bytes"
@@ -93,7 +93,7 @@ func NewHTTPHandler(cfg *HandlerConfig, defaults HTTPDefaultsConfig, logger Logg
 }
 
 // ProcessTask sends the task to the configured HTTP endpoint.
-func (h *HTTPHandler) ProcessTask(ctx context.Context, task *Task) error {
+func (h *HTTPHandler) ProcessTask(ctx context.Context, task Task) error {
 	req, err := h.buildRequest(ctx, task)
 	if err != nil {
 		return fmt.Errorf("failed to build request: %w", err)
@@ -112,7 +112,7 @@ func (h *HTTPHandler) ProcessTask(ctx context.Context, task *Task) error {
 }
 
 // buildRequest creates the HTTP request for the task.
-func (h *HTTPHandler) buildRequest(ctx context.Context, task *Task) (*http.Request, error) {
+func (h *HTTPHandler) buildRequest(ctx context.Context, task Task) (*http.Request, error) {
 	// Build request payload
 	payload := task.Payload()
 
@@ -187,7 +187,7 @@ func (h *HTTPHandler) applyAuth(req *http.Request) {
 }
 
 // handleResponse processes the HTTP response and determines success/retry/failure.
-func (h *HTTPHandler) handleResponse(resp *http.Response, task *Task) error {
+func (h *HTTPHandler) handleResponse(resp *http.Response, task Task) error {
 	body, _ := io.ReadAll(resp.Body)
 
 	h.logger.Info(fmt.Sprintf("HTTP handler: received status %d for task %s", resp.StatusCode, task.ID()))

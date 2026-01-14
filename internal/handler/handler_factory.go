@@ -1,4 +1,4 @@
-package worker
+package handler
 
 import (
 	"context"
@@ -34,7 +34,7 @@ func NewHandlerFromConfig(cfg *HandlerConfig, defaults DefaultsConfig, logger Lo
 
 // newLogHandler creates a handler that just logs the task (useful for debugging).
 func newLogHandler(logger Logger) HandlerFunc {
-	return func(ctx context.Context, task *Task) error {
+	return func(ctx context.Context, task Task) error {
 		logger.Info(fmt.Sprintf("LOG HANDLER: task_id=%s type=%s payload=%s retry=%d/%d",
 			task.ID(),
 			task.Type(),
