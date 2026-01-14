@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/publikey/runqy-worker/internal/handler"
 )
@@ -88,47 +89,33 @@ func (mux *ServeMux) HasHandler(taskType string) bool {
 	return ok
 }
 
-// NewHandlerFromConfig creates a Handler from a HandlerConfig.
-// Uses types from config_yaml.go: HandlerConfig, DefaultsConfig
-func NewHandlerFromConfig(cfg *HandlerConfig, defaults DefaultsConfig, logger Logger) (HandlerFunc, error) {
-	// Convert our config types to internal handler types
-	internalCfg := &handler.HandlerConfig{
-		Type:    cfg.Type,
-		URL:     cfg.URL,
-		Method:  cfg.Method,
-		Timeout: cfg.Timeout,
-		Headers: cfg.Headers,
-		Auth: handler.AuthConfig{
-			Type:     cfg.Auth.Type,
-			Username: cfg.Auth.Username,
-			Password: cfg.Auth.Password,
-			Token:    cfg.Auth.Token,
-			Header:   cfg.Auth.Header,
-			Key:      cfg.Auth.Key,
-		},
-		RetryOn: cfg.RetryOn,
-		FailOn:  cfg.FailOn,
-	}
+// StdioHandler communicates with a child process via stdin/stdout JSON lines.
+// It wraps the internal handler.StdioHandler.
+type StdioHandler struct {
+	internal *handler.StdioHandler
+}
 
-	internalDefaults := handler.DefaultsConfig{
-		HTTP: handler.HTTPDefaultsConfig{
-			Timeout: defaults.HTTP.Timeout,
-			RetryOn: defaults.HTTP.RetryOn,
-			FailOn:  defaults.HTTP.FailOn,
-			Headers: defaults.HTTP.Headers,
-		},
+// NewStdioHandler creates a StdioHandler from stdin/stdout pipes.
+// Call Start() to begin reading responses, and Stop() to clean up.
+func NewStdioHandler(stdin io.Writer, stdout io.Reader, logger Logger) *StdioHandler {
+	return &StdioHandler{
+		internal: handler.NewStdioHandler(stdin, stdout, &loggerAdapter{logger}),
 	}
+}
 
-	// Create internal handler
-	internalHandler, err := handler.NewHandlerFromConfig(internalCfg, internalDefaults, &loggerAdapter{logger})
-	if err != nil {
-		return nil, err
-	}
+// Start begins reading responses from stdout in a background goroutine.
+func (h *StdioHandler) Start() {
+	h.internal.Start()
+}
 
-	// Wrap it to return our HandlerFunc type
-	return func(ctx context.Context, task *Task) error {
-		return internalHandler(ctx, task)
-	}, nil
+// Stop signals the handler to stop and waits for cleanup.
+func (h *StdioHandler) Stop() {
+	h.internal.Stop()
+}
+
+// ProcessTask sends a task to the child process and waits for the response.
+func (h *StdioHandler) ProcessTask(ctx context.Context, task *Task) error {
+	return h.internal.ProcessTask(ctx, task)
 }
 
 // loggerAdapter adapts our Logger (variadic args) to handler.Logger (format + args)

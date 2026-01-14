@@ -1,93 +1,18 @@
-# runqy-worker configuration
-# Copy this file to config.yml and adjust as needed
-#
-# BREAKING CHANGE: Workers now bootstrap from a central server.
-# Redis credentials and task handlers are provided by the server.
-
-# Server connection (required)
-# Worker contacts this server on startup to register and receive configuration
 server:
-  url: "${RUNQY_SERVER_URL}"
-  api_key: "${RUNQY_API_KEY}"
+  url: "http://localhost:8081"
+  api_key: "dev-api-key-12345"
 
-# Worker settings
 worker:
-  queue: "inference"           # Single queue name to listen on
-  concurrency: 4               # Max parallel tasks
-  shutdown_timeout: 30s        # Time to wait for graceful shutdown
+  queue: "inference"
+  concurrency: 1
+  shutdown_timeout: 30s
 
-# Bootstrap retry settings (optional)
-# If the server is unavailable, worker will retry before failing
 bootstrap:
-  retries: 3                   # Number of retry attempts (default: 3)
-  retry_delay: "5s"            # Delay between retries (default: 5s)
+  retries: 3
+  retry_delay: "5s"
 
-# Git authentication (optional)
-# Used when cloning private repositories
-git:
-  ssh_key: ""                  # Path to SSH private key file
-  # ssh_key: "/path/to/id_rsa"
-  token: ""                    # Personal access token or password
-  # token: "${GIT_TOKEN}"
-
-# Deployment settings (optional)
 deployment:
-  dir: "./deployment"          # Directory for code deployment (default: ./deployment)
+  dir: "./deployment"
 
-# Retry settings (optional)
 retry:
-  max_retry: 5                 # Max retry attempts for failed tasks
-
-# ============================================================================
-# How Bootstrap Works:
-# ============================================================================
-#
-# 1. Worker POSTs to {server.url}/worker/register with:
-#    - queue name
-#    - hostname, OS, version
-#    - Authorization: Bearer {api_key}
-#
-# 2. Server responds with:
-#    - Redis connection credentials
-#    - Queue priority configuration
-#    - Git repository URL and branch to clone
-#    - Startup command for FastAPI process
-#    - Environment variables
-#    - Task type -> endpoint path mappings
-#
-# 3. Worker then:
-#    - Connects to Redis using server-provided credentials
-#    - Clones the git repository (using git.ssh_key or git.token if private)
-#    - Creates Python virtualenv and installs dependencies
-#    - Starts FastAPI process on localhost:8080
-#    - Begins processing tasks, forwarding them to local FastAPI
-#
-# ============================================================================
-# Example Server Response:
-# ============================================================================
-#
-# {
-#   "redis": {
-#     "addr": "redis.example.com:6379",
-#     "password": "secret",
-#     "db": 0,
-#     "use_tls": true
-#   },
-#   "queue": {
-#     "name": "inference",
-#     "priority": 6
-#   },
-#   "deployment": {
-#     "git_url": "https://github.com/example/inference-service.git",
-#     "branch": "main",
-#     "startup_cmd": "uvicorn app.main:app --host 0.0.0.0 --port 8080",
-#     "env_vars": {
-#       "MODEL_PATH": "/models/gpt"
-#     },
-#     "startup_timeout_secs": 300
-#   },
-#   "routes": {
-#     "inference:predict": "/predict",
-#     "inference:batch": "/batch"
-#   }
-# }
+  max_retry: 2

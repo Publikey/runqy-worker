@@ -64,10 +64,6 @@ func TestBootstrapRequest(t *testing.T) {
 				EnvVars:            map[string]string{"KEY": "value"},
 				StartupTimeoutSecs: 60,
 			},
-			Routes: map[string]string{
-				"task:type1": "/endpoint1",
-				"task:type2": "/endpoint2",
-			},
 		}
 		json.NewEncoder(w).Encode(resp)
 	}))
@@ -108,9 +104,6 @@ func TestBootstrapRequest(t *testing.T) {
 	if resp.Queue.Name != "test-queue" {
 		t.Errorf("expected queue name 'test-queue', got %q", resp.Queue.Name)
 	}
-	if len(resp.Routes) != 2 {
-		t.Errorf("expected 2 routes, got %d", len(resp.Routes))
-	}
 }
 
 func TestBootstrapRetry(t *testing.T) {
@@ -127,7 +120,6 @@ func TestBootstrapRetry(t *testing.T) {
 			Redis:      RedisConfig{Addr: "localhost:6379"},
 			Queue:      QueueConfig{Name: "q", Priority: 1},
 			Deployment: DeploymentConfig{GitURL: "https://github.com/t/r.git", Branch: "main", StartupCmd: "cmd"},
-			Routes:     map[string]string{"t": "/e"},
 		}
 		json.NewEncoder(w).Encode(resp)
 	}))
@@ -164,7 +156,6 @@ func TestBootstrapValidation(t *testing.T) {
 				Redis:      RedisConfig{Addr: "localhost:6379"},
 				Queue:      QueueConfig{Name: "q", Priority: 1},
 				Deployment: DeploymentConfig{GitURL: "https://github.com/t/r.git", Branch: "main", StartupCmd: "cmd"},
-				Routes:     map[string]string{"t": "/e"},
 			},
 			wantErr: false,
 		},
@@ -174,7 +165,6 @@ func TestBootstrapValidation(t *testing.T) {
 				Redis:      RedisConfig{Addr: ""},
 				Queue:      QueueConfig{Name: "q", Priority: 1},
 				Deployment: DeploymentConfig{GitURL: "https://github.com/t/r.git", Branch: "main", StartupCmd: "cmd"},
-				Routes:     map[string]string{"t": "/e"},
 			},
 			wantErr: true,
 		},
@@ -184,7 +174,6 @@ func TestBootstrapValidation(t *testing.T) {
 				Redis:      RedisConfig{Addr: "localhost:6379"},
 				Queue:      QueueConfig{Name: "", Priority: 1},
 				Deployment: DeploymentConfig{GitURL: "https://github.com/t/r.git", Branch: "main", StartupCmd: "cmd"},
-				Routes:     map[string]string{"t": "/e"},
 			},
 			wantErr: true,
 		},
@@ -194,7 +183,6 @@ func TestBootstrapValidation(t *testing.T) {
 				Redis:      RedisConfig{Addr: "localhost:6379"},
 				Queue:      QueueConfig{Name: "q", Priority: 1},
 				Deployment: DeploymentConfig{GitURL: "", Branch: "main", StartupCmd: "cmd"},
-				Routes:     map[string]string{"t": "/e"},
 			},
 			wantErr: true,
 		},
@@ -204,7 +192,6 @@ func TestBootstrapValidation(t *testing.T) {
 				Redis:      RedisConfig{Addr: "localhost:6379"},
 				Queue:      QueueConfig{Name: "q", Priority: 1},
 				Deployment: DeploymentConfig{GitURL: "https://github.com/t/r.git", Branch: "", StartupCmd: "cmd"},
-				Routes:     map[string]string{"t": "/e"},
 			},
 			wantErr: true,
 		},
@@ -214,17 +201,6 @@ func TestBootstrapValidation(t *testing.T) {
 				Redis:      RedisConfig{Addr: "localhost:6379"},
 				Queue:      QueueConfig{Name: "q", Priority: 1},
 				Deployment: DeploymentConfig{GitURL: "https://github.com/t/r.git", Branch: "main", StartupCmd: ""},
-				Routes:     map[string]string{"t": "/e"},
-			},
-			wantErr: true,
-		},
-		{
-			name: "empty routes",
-			resp: Response{
-				Redis:      RedisConfig{Addr: "localhost:6379"},
-				Queue:      QueueConfig{Name: "q", Priority: 1},
-				Deployment: DeploymentConfig{GitURL: "https://github.com/t/r.git", Branch: "main", StartupCmd: "cmd"},
-				Routes:     map[string]string{},
 			},
 			wantErr: true,
 		},

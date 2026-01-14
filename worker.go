@@ -25,6 +25,7 @@ type Worker struct {
 	// Bootstrap state
 	bootstrapResponse *BootstrapResponse
 	supervisor        *ProcessSupervisor
+	stdioHandler      *StdioHandler
 	bootstrapped      bool
 
 	done   chan struct{}
@@ -148,29 +149,19 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 	}
 
 	// Phase 5: Start supervised process
-	w.logger.Info("Starting FastAPI process...")
+	w.logger.Info("Starting supervised process...")
 	w.supervisor = newProcessSupervisor(deployment, resp.Deployment, w.logger)
 	if err := w.supervisor.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start Python process: %w", err)
+		return fmt.Errorf("failed to start process: %w", err)
 	}
-	w.logger.Info("FastAPI process started on localhost:8080")
+	w.logger.Info("Supervised process started and ready")
 
-	// Phase 6: Configure handlers from routes
-	w.logger.Info("Configuring %d task handlers...", len(resp.Routes))
-	for taskType, endpointPath := range resp.Routes {
-		url := "http://localhost:8080" + endpointPath
-		handlerCfg := &HandlerConfig{
-			Type:   "http",
-			URL:    url,
-			Method: "POST",
-		}
-		handler, err := NewHandlerFromConfig(handlerCfg, w.config.Defaults, w.logger)
-		if err != nil {
-			return fmt.Errorf("failed to create handler for %s: %w", taskType, err)
-		}
-		w.Handle(taskType, handler)
-		w.logger.Info("  %s -> %s", taskType, url)
-	}
+	// Phase 6: Create stdio handler for communication with supervised process
+	w.logger.Info("Setting up stdio handler for task communication...")
+	w.stdioHandler = NewStdioHandler(w.supervisor.Stdin(), w.supervisor.Stdout(), w.logger)
+	w.stdioHandler.Start()
+	w.HandleDefault(w.stdioHandler.ProcessTask)
+	w.logger.Info("Stdio handler configured as default task handler")
 
 	w.bootstrapped = true
 	w.logger.Info("Bootstrap completed successfully")
@@ -355,11 +346,17 @@ func (w *Worker) shutdown() error {
 		w.heartbeat.stop()
 	}
 
-	// Stop supervised Python process
+	// Stop stdio handler
+	if w.stdioHandler != nil {
+		w.logger.Info("Stopping stdio handler...")
+		w.stdioHandler.Stop()
+	}
+
+	// Stop supervised process
 	if w.supervisor != nil {
-		w.logger.Info("Stopping supervised Python process...")
+		w.logger.Info("Stopping supervised process...")
 		if err := w.supervisor.Stop(); err != nil {
-			w.logger.Error("Error stopping Python process:", err)
+			w.logger.Error("Error stopping supervised process:", err)
 		}
 	}
 

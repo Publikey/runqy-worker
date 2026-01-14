@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -14,7 +15,7 @@ import (
 	"time"
 )
 
-// ProcessSupervisor manages a supervised Python FastAPI process.
+// ProcessSupervisor manages a supervised child process.
 type ProcessSupervisor struct {
 	cmd        *exec.Cmd
 	deployment *DeploymentResult
@@ -22,6 +23,11 @@ type ProcessSupervisor struct {
 	envVars    map[string]string
 	timeoutSec int
 	logger     Logger
+
+	// Pipes for stdio communication
+	stdin        io.WriteCloser
+	stdout       io.ReadCloser
+	stdoutReader *bufio.Reader // Buffered reader for stdout (preserves buffered data)
 
 	mu        sync.RWMutex
 	healthy   bool
@@ -51,6 +57,7 @@ func NewProcessSupervisor(deployment *DeploymentResult, spec DeploymentConfig, l
 }
 
 // Start starts the supervised process and waits for it to become healthy.
+// The process signals readiness by writing {"status":"ready"} to stdout.
 func (s *ProcessSupervisor) Start(ctx context.Context) error {
 	// Parse startup command
 	args := ParseCommand(s.startupCmd)
@@ -69,11 +76,20 @@ func (s *ProcessSupervisor) Start(ctx context.Context) error {
 	// Build environment
 	s.cmd.Env = s.buildEnvironment()
 
-	// Create pipes for stdout/stderr
+	// Create pipes for stdin/stdout/stderr
+	stdin, err := s.cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdin pipe: %w", err)
+	}
+	s.stdin = stdin
+
 	stdout, err := s.cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
+	s.stdout = stdout
+	// Create buffered reader - any data buffered during startup remains available
+	s.stdoutReader = bufio.NewReaderSize(stdout, 64*1024)
 
 	stderr, err := s.cmd.StderrPipe()
 	if err != nil {
@@ -90,33 +106,75 @@ func (s *ProcessSupervisor) Start(ctx context.Context) error {
 
 	s.logger.Info("Process started with PID %d", s.cmd.Process.Pid)
 
-	// Channel to signal when startup phrase is detected
-	startupDetected := make(chan struct{})
-	startupOnce := sync.Once{}
-
-	// Start log streaming goroutines
-	go s.streamLogs(stdout, "STDOUT", startupDetected, &startupOnce)
-	go s.streamLogs(stderr, "STDERR", startupDetected, &startupOnce)
+	// Stream stderr to logs (stderr is for logging, stdout is for communication)
+	go s.streamStderr(stderr)
 
 	// Start process monitor goroutine
 	go s.monitorProcess()
 
-	// Wait for startup with timeout
+	// Wait for startup with timeout - look for {"status":"ready"} on stdout
 	startupTimeout := time.Duration(s.timeoutSec) * time.Second
 	s.logger.Info("Waiting for startup (timeout: %v)...", startupTimeout)
 
+	if err := s.waitForReady(ctx, startupTimeout); err != nil {
+		s.Stop()
+		return err
+	}
+
+	s.mu.Lock()
+	s.healthy = true
+	s.mu.Unlock()
+	s.logger.Info("Process startup detected - service is ready")
+	return nil
+}
+
+// waitForReady waits for the child to send {"status":"ready"} on stdout.
+// Uses the buffered reader so any extra data remains available for StdioHandler.
+func (s *ProcessSupervisor) waitForReady(ctx context.Context, timeout time.Duration) error {
+	readyCh := make(chan struct{})
+	errCh := make(chan error, 1)
+
+	// Read stdout looking for ready signal using the buffered reader
+	go func() {
+		for {
+			line, err := s.stdoutReader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					errCh <- fmt.Errorf("stdout closed before ready signal received")
+				} else {
+					errCh <- fmt.Errorf("error reading stdout: %w", err)
+				}
+				return
+			}
+
+			// Trim newline
+			line = strings.TrimSuffix(line, "\n")
+			line = strings.TrimSuffix(line, "\r")
+
+			s.logger.Debug("[STDOUT] %s", line)
+
+			// Try to parse as JSON status message
+			var status struct {
+				Status string `json:"status"`
+			}
+			if err := json.Unmarshal([]byte(line), &status); err == nil {
+				if status.Status == "ready" {
+					close(readyCh)
+					return
+				}
+			}
+		}
+	}()
+
 	select {
-	case <-startupDetected:
-		s.mu.Lock()
-		s.healthy = true
-		s.mu.Unlock()
-		s.logger.Info("Process startup detected - service is healthy")
+	case <-readyCh:
 		return nil
 
-	case <-time.After(startupTimeout):
-		s.logger.Error("Startup timeout exceeded (%v)", startupTimeout)
-		s.Stop()
-		return fmt.Errorf("startup timeout exceeded after %v", startupTimeout)
+	case err := <-errCh:
+		return err
+
+	case <-time.After(timeout):
+		return fmt.Errorf("startup timeout exceeded after %v", timeout)
 
 	case <-s.done:
 		s.mu.RLock()
@@ -125,8 +183,23 @@ func (s *ProcessSupervisor) Start(ctx context.Context) error {
 		return fmt.Errorf("process exited during startup with code %d", exitCode)
 
 	case <-ctx.Done():
-		s.Stop()
 		return ctx.Err()
+	}
+}
+
+// streamStderr reads stderr and logs output.
+func (s *ProcessSupervisor) streamStderr(stderr io.ReadCloser) {
+	scanner := bufio.NewScanner(stderr)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		s.logger.Info("[STDERR] %s", line)
+	}
+
+	if err := scanner.Err(); err != nil {
+		s.logger.Warn("Error reading stderr: %v", err)
 	}
 }
 
@@ -167,46 +240,15 @@ func (s *ProcessSupervisor) buildEnvironment() []string {
 	return env
 }
 
-// streamLogs reads from a pipe and logs output, detecting startup phrases.
-func (s *ProcessSupervisor) streamLogs(pipe io.ReadCloser, prefix string, startupDetected chan struct{}, once *sync.Once) {
-	scanner := bufio.NewScanner(pipe)
-	// Increase buffer size for long lines
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		s.logger.Info("[%s] %s", prefix, line)
-
-		// Check for startup indicators
-		if s.isStartupIndicator(line) {
-			once.Do(func() {
-				close(startupDetected)
-			})
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		s.logger.Warn("Error reading %s: %v", prefix, err)
-	}
+// Stdin returns the stdin pipe for writing to the child process.
+func (s *ProcessSupervisor) Stdin() io.Writer {
+	return s.stdin
 }
 
-// isStartupIndicator checks if a log line indicates successful startup.
-func (s *ProcessSupervisor) isStartupIndicator(line string) bool {
-	indicators := []string{
-		"Uvicorn running",
-		"Application startup complete",
-		"Started server process",
-		"Waiting for application startup",
-	}
-
-	lineLower := strings.ToLower(line)
-	for _, indicator := range indicators {
-		if strings.Contains(lineLower, strings.ToLower(indicator)) {
-			return true
-		}
-	}
-	return false
+// Stdout returns the buffered stdout reader for reading from the child process.
+// This is a buffered reader that preserves any data read during startup detection.
+func (s *ProcessSupervisor) Stdout() io.Reader {
+	return s.stdoutReader
 }
 
 // monitorProcess waits for the process to exit and updates state.

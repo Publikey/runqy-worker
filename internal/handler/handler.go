@@ -25,41 +25,6 @@ type Task interface {
 	ResultWriter() io.Writer
 }
 
-// HandlerConfig defines how to handle a specific task type.
-type HandlerConfig struct {
-	Type    string            // http (default), log
-	URL     string            // HTTP endpoint URL
-	Method  string            // HTTP method (default: POST)
-	Timeout string            // Request timeout
-	Headers map[string]string // Custom headers
-	Auth    AuthConfig        // Authentication config
-	RetryOn []int             // HTTP status codes to retry
-	FailOn  []int             // HTTP status codes for permanent failure
-}
-
-// AuthConfig for HTTP authentication.
-type AuthConfig struct {
-	Type     string // basic, bearer, api_key
-	Username string // For basic auth
-	Password string // For basic auth
-	Token    string // For bearer auth
-	Header   string // For api_key auth (header name)
-	Key      string // For api_key auth (key value)
-}
-
-// DefaultsConfig provides default values for handlers.
-type DefaultsConfig struct {
-	HTTP HTTPDefaultsConfig
-}
-
-// HTTPDefaultsConfig provides default values for HTTP handlers.
-type HTTPDefaultsConfig struct {
-	Timeout string
-	RetryOn []int
-	FailOn  []int
-	Headers map[string]string
-}
-
 // SkipRetryError signals that the task should fail permanently without retry.
 type SkipRetryError struct {
 	Reason string

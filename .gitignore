@@ -1,6 +1,9 @@
 # Config with secrets
 config.yml
 
+# Runtime deployment directory
+deployment/
+
 # Go binaries
 *.exe
 *.exe~

@@ -72,35 +72,6 @@ func TestParseCommand(t *testing.T) {
 	}
 }
 
-func TestIsStartupIndicator(t *testing.T) {
-	supervisor := &ProcessSupervisor{}
-
-	tests := []struct {
-		line     string
-		expected bool
-	}{
-		{"INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)", true},
-		{"INFO:     Application startup complete.", true},
-		{"INFO:     Started server process [12345]", true},
-		{"INFO:     Waiting for application startup.", true},
-		{"uvicorn running on localhost", true},
-		{"application startup complete", true},
-		{"Loading model...", false},
-		{"Initializing database connection", false},
-		{"Ready to accept connections", false},
-		{"", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.line, func(t *testing.T) {
-			result := supervisor.isStartupIndicator(tt.line)
-			if result != tt.expected {
-				t.Errorf("isStartupIndicator(%q) = %v, want %v", tt.line, result, tt.expected)
-			}
-		})
-	}
-}
-
 func TestProcessSupervisorConstruction(t *testing.T) {
 	deployment := &DeploymentResult{
 		RepoPath:   "/path/to/repo",

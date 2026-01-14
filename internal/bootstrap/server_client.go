@@ -38,7 +38,6 @@ type Response struct {
 	Redis      RedisConfig      `json:"redis"`
 	Queue      QueueConfig      `json:"queue"`
 	Deployment DeploymentConfig `json:"deployment"`
-	Routes     map[string]string `json:"routes"` // task_type -> endpoint_path
 }
 
 // RedisConfig holds Redis connection settings from server.
@@ -137,8 +136,8 @@ func Bootstrap(ctx context.Context, config Config, logger Logger) (*Response, er
 			return nil, fmt.Errorf("invalid bootstrap response: %w", err)
 		}
 
-		logger.Info("Bootstrap successful: redis=%s, queue=%s, routes=%d",
-			resp.Redis.Addr, resp.Queue.Name, len(resp.Routes))
+		logger.Info("Bootstrap successful: redis=%s, queue=%s",
+			resp.Redis.Addr, resp.Queue.Name)
 		return resp, nil
 	}
 
@@ -194,9 +193,6 @@ func ValidateResponse(resp *Response) error {
 	}
 	if resp.Deployment.StartupCmd == "" {
 		return fmt.Errorf("deployment.startup_cmd is required")
-	}
-	if len(resp.Routes) == 0 {
-		return fmt.Errorf("routes is required and must not be empty")
 	}
 	return nil
 }

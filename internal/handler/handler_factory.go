@@ -2,46 +2,25 @@ package handler
 
 import (
 	"context"
-	"fmt"
+	"io"
 )
 
-// NewHandlerFromConfig creates a Handler from a HandlerConfig.
-func NewHandlerFromConfig(cfg *HandlerConfig, defaults DefaultsConfig, logger Logger) (HandlerFunc, error) {
-	if cfg == nil {
-		return nil, fmt.Errorf("handler config is nil")
-	}
-
-	handlerType := cfg.Type
-	if handlerType == "" {
-		handlerType = "http" // default
-	}
-
-	switch handlerType {
-	case "http":
-		if cfg.URL == "" {
-			return nil, fmt.Errorf("http handler requires url")
-		}
-		h := NewHTTPHandler(cfg, defaults.HTTP, logger)
-		return h.ProcessTask, nil
-
-	case "log":
-		return newLogHandler(logger), nil
-
-	default:
-		return nil, fmt.Errorf("unknown handler type: %s", handlerType)
-	}
+// NewStdioHandlerFromSupervisor creates a StdioHandler from process stdin/stdout.
+// This is the primary way to create a handler for communicating with supervised processes.
+func NewStdioHandlerFromSupervisor(stdin io.Writer, stdout io.Reader, logger Logger) *StdioHandler {
+	return NewStdioHandler(stdin, stdout, logger)
 }
 
-// newLogHandler creates a handler that just logs the task (useful for debugging).
-func newLogHandler(logger Logger) HandlerFunc {
+// NewLogHandler creates a handler that just logs the task (useful for debugging).
+func NewLogHandler(logger Logger) HandlerFunc {
 	return func(ctx context.Context, task Task) error {
-		logger.Info(fmt.Sprintf("LOG HANDLER: task_id=%s type=%s payload=%s retry=%d/%d",
+		logger.Info("LOG HANDLER: task_id=%s type=%s payload=%s retry=%d/%d",
 			task.ID(),
 			task.Type(),
 			string(task.Payload()),
 			task.RetryCount(),
 			task.MaxRetry(),
-		))
+		)
 		return nil
 	}
 }
