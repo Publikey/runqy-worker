@@ -61,6 +61,7 @@ type DeploymentConfig struct {
 	StartupCmd         string            `json:"startup_cmd"`          // Command to start FastAPI
 	EnvVars            map[string]string `json:"env_vars"`             // Environment variables
 	StartupTimeoutSecs int               `json:"startup_timeout_secs"` // Timeout for "Uvicorn running"
+	Mode               string            `json:"mode"`                 // "long_running" (default) or "one_shot"
 }
 
 // Request contains worker metadata sent to server during registration.
