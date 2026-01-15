@@ -22,6 +22,7 @@ coverage.html
 *.swo
 .claude/
 CLAUDE.md
+*_PLAN.md
 
 # OS
 .DS_Store
