@@ -1,7 +1,6 @@
 package worker
 
 import (
-	"crypto/tls"
 	"fmt"
 	"os"
 	"regexp"
@@ -12,17 +11,35 @@ import (
 
 // YAMLConfig represents the YAML configuration file structure.
 type YAMLConfig struct {
-	Redis    RedisConfig              `yaml:"redis"`
-	Worker   WorkerConfig             `yaml:"worker"`
-	Queues   map[string]*QueueConfig  `yaml:"queues"`
-	Retry    RetryConfig              `yaml:"retry"`
-	Defaults DefaultsConfig           `yaml:"defaults"`
+	Server     ServerConfig   `yaml:"server"`
+	Worker     WorkerConfig   `yaml:"worker"`
+	Bootstrap  BootstrapConfig `yaml:"bootstrap"`
+	Git        GitConfig      `yaml:"git"`
+	Deployment DeploymentYAML `yaml:"deployment"`
+	Retry      RetryConfig    `yaml:"retry"`
 }
 
-// QueueConfig defines a queue with its priority and handler.
-type QueueConfig struct {
-	Priority int            `yaml:"priority"` // Weight for queue processing (higher = more priority)
-	Handler  *HandlerConfig `yaml:"handler"`  // How to handle tasks from this queue
+// ServerConfig holds runqy-server connection settings.
+type ServerConfig struct {
+	URL    string `yaml:"url"`     // Required: runqy-server URL
+	APIKey string `yaml:"api_key"` // Required: Authentication key
+}
+
+// BootstrapConfig holds bootstrap retry settings.
+type BootstrapConfig struct {
+	Retries    int    `yaml:"retries"`     // Number of retries (default: 3)
+	RetryDelay string `yaml:"retry_delay"` // Delay between retries (default: 5s)
+}
+
+// GitConfig holds git authentication settings.
+type GitConfig struct {
+	SSHKey string `yaml:"ssh_key"` // Path to SSH private key file
+	Token  string `yaml:"token"`   // Personal access token or password
+}
+
+// DeploymentYAML holds deployment directory settings.
+type DeploymentYAML struct {
+	Dir string `yaml:"dir"` // Directory for code deployment (default: "./deployment")
 }
 
 // DefaultsConfig provides default values for handlers.
@@ -60,16 +77,9 @@ type AuthConfig struct {
 	Key      string `yaml:"key"`      // For api_key auth (key value)
 }
 
-// RedisConfig holds Redis connection settings from YAML.
-type RedisConfig struct {
-	Addr     string `yaml:"addr"`
-	Password string `yaml:"password"`
-	DB       int    `yaml:"db"`
-	TLS      bool   `yaml:"tls"`
-}
-
 // WorkerConfig holds worker settings from YAML.
 type WorkerConfig struct {
+	Queue           string `yaml:"queue"`            // Single queue name to listen on
 	Concurrency     int    `yaml:"concurrency"`
 	ShutdownTimeout string `yaml:"shutdown_timeout"`
 }
@@ -130,20 +140,12 @@ func expandEnvVars(data []byte) []byte {
 func toWorkerConfig(yc *YAMLConfig) Config {
 	cfg := DefaultConfig()
 
-	// Redis settings
-	if yc.Redis.Addr != "" {
-		cfg.RedisAddr = yc.Redis.Addr
-	}
-	cfg.RedisPassword = yc.Redis.Password
-	cfg.RedisDB = yc.Redis.DB
-
-	// TLS is not fully configurable via YAML (just enable/disable)
-	// For custom TLS config, use programmatic configuration
-	if yc.Redis.TLS {
-		cfg.RedisTLS = &defaultTLSConfig
-	}
+	// Server settings (required)
+	cfg.ServerURL = yc.Server.URL
+	cfg.APIKey = yc.Server.APIKey
 
 	// Worker settings
+	cfg.Queue = yc.Worker.Queue
 	if yc.Worker.Concurrency > 0 {
 		cfg.Concurrency = yc.Worker.Concurrency
 	}
@@ -153,23 +155,23 @@ func toWorkerConfig(yc *YAMLConfig) Config {
 		}
 	}
 
-	// Queues - extract priorities and handlers
-	if len(yc.Queues) > 0 {
-		cfg.Queues = make(map[string]int)
-		cfg.QueueHandlers = make(map[string]*HandlerConfig)
-		for name, qc := range yc.Queues {
-			if qc == nil {
-				continue
-			}
-			priority := qc.Priority
-			if priority <= 0 {
-				priority = 1
-			}
-			cfg.Queues[name] = priority
-			if qc.Handler != nil {
-				cfg.QueueHandlers[name] = qc.Handler
-			}
+	// Bootstrap settings
+	if yc.Bootstrap.Retries > 0 {
+		cfg.BootstrapRetries = yc.Bootstrap.Retries
+	}
+	if yc.Bootstrap.RetryDelay != "" {
+		if d, err := time.ParseDuration(yc.Bootstrap.RetryDelay); err == nil {
+			cfg.BootstrapRetryDelay = d
 		}
+	}
+
+	// Git authentication
+	cfg.GitSSHKey = yc.Git.SSHKey
+	cfg.GitToken = yc.Git.Token
+
+	// Deployment settings
+	if yc.Deployment.Dir != "" {
+		cfg.DeploymentDir = yc.Deployment.Dir
 	}
 
 	// Retry settings
@@ -177,11 +179,5 @@ func toWorkerConfig(yc *YAMLConfig) Config {
 		cfg.MaxRetry = yc.Retry.MaxRetry
 	}
 
-	// Defaults
-	cfg.Defaults = yc.Defaults
-
 	return cfg
 }
-
-// defaultTLSConfig is a minimal TLS configuration for Redis connections.
-var defaultTLSConfig = tls.Config{}

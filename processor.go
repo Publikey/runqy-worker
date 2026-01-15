@@ -14,6 +14,7 @@ type processor struct {
 	queueHandlers map[string]HandlerFunc     // queue name -> handler (for queue-based routing)
 	config        Config
 	queues        []string // Queue names in priority order
+	supervisor    *ProcessSupervisor         // supervised process (may be nil)
 
 	done   chan struct{}
 	wg     sync.WaitGroup
@@ -39,6 +40,11 @@ func newProcessor(rdb *redisClient, handler Handler, cfg Config) *processor {
 // SetQueueHandler sets the handler for a specific queue.
 func (p *processor) SetQueueHandler(queue string, handler HandlerFunc) {
 	p.queueHandlers[queue] = handler
+}
+
+// SetSupervisor sets the process supervisor for health checks.
+func (p *processor) SetSupervisor(supervisor *ProcessSupervisor) {
+	p.supervisor = supervisor
 }
 
 // buildQueueList creates a weighted list of queues for round-robin selection.
@@ -85,6 +91,13 @@ func (p *processor) worker(id int) {
 
 // processOne attempts to dequeue and process a single task.
 func (p *processor) processOne() {
+	// Check if supervised process is healthy
+	if p.supervisor != nil && !p.supervisor.IsHealthy() {
+		p.logger.Error("Worker in degraded state - supervised process has crashed")
+		time.Sleep(5 * time.Second)
+		return
+	}
+
 	ctx := context.Background()
 
 	// Dequeue a task
@@ -102,8 +115,7 @@ func (p *processor) processOne() {
 
 	queueName := task.queue
 
-	// Set up result writer context
-	task.ResultWriter().SetContext(ctx)
+	// Context is set by the task during dequeue
 
 	p.logger.Info(fmt.Sprintf("Processing task %s (queue=%s, type=%s, retry=%d)", task.id, queueName, task.typename, task.retry))
 

@@ -7,7 +7,24 @@ import (
 
 // Config holds the configuration for a Worker.
 type Config struct {
-	// Redis connection settings
+	// Server Bootstrap (required for dynamic configuration)
+	ServerURL string // Required: runqy-server URL (e.g., "https://server.example.com")
+	APIKey    string // Required: Authentication key for server
+	Queue     string // Required: Single queue name to listen on
+	Version   string // Worker version (for registration metadata)
+
+	// Bootstrap Retry
+	BootstrapRetries    int           // Number of retries for server contact (default: 3)
+	BootstrapRetryDelay time.Duration // Delay between retries (default: 5s)
+
+	// Git Authentication
+	GitSSHKey string // Optional: Path to SSH private key file
+	GitToken  string // Optional: Personal access token or password
+
+	// Deployment
+	DeploymentDir string // Directory for code deployment (default: "./deployment")
+
+	// Redis connection settings (populated by bootstrap, not required in config)
 	RedisAddr     string
 	RedisPassword string
 	RedisDB       int
@@ -15,7 +32,7 @@ type Config struct {
 
 	// Worker settings
 	Concurrency int            // Max parallel tasks (default: 1)
-	Queues      map[string]int // Queue name -> priority weight (higher = more priority)
+	Queues      map[string]int // Queue name -> priority weight (populated by bootstrap)
 
 	// Retry settings
 	MaxRetry       int                                           // Max retry attempts (default: 25)
@@ -35,8 +52,16 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		RedisAddr:       "localhost:6379",
-		RedisDB:         0,
+		// Bootstrap defaults
+		BootstrapRetries:    3,
+		BootstrapRetryDelay: 5 * time.Second,
+		DeploymentDir:       "./deployment",
+
+		// Redis defaults (will be overwritten by bootstrap)
+		RedisAddr: "localhost:6379",
+		RedisDB:   0,
+
+		// Worker defaults
 		Concurrency:     1,
 		Queues:          map[string]int{"default": 1},
 		MaxRetry:        25,

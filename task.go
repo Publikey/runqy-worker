@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"io"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -51,7 +52,7 @@ func (t *Task) Queue() string {
 }
 
 // ResultWriter returns a writer that stores the result in Redis.
-func (t *Task) ResultWriter() *TaskResultWriter {
+func (t *Task) ResultWriter() io.Writer {
 	return &TaskResultWriter{
 		task: t,
 	}
