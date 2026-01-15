@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -58,6 +59,15 @@ func buildQueueList(queueWeights map[string]int) []string {
 	return result
 }
 
+// parentQueueName extracts the parent queue name from a sub-queue name.
+// For example: "inference:high" -> "inference", "simple" -> "simple"
+func parentQueueName(subQueueName string) string {
+	if idx := strings.Index(subQueueName, ":"); idx > 0 {
+		return subQueueName[:idx]
+	}
+	return subQueueName
+}
+
 // start begins processing tasks with the configured concurrency.
 func (p *processor) start() {
 	for i := 0; i < p.config.Concurrency; i++ {
@@ -108,12 +118,15 @@ func (p *processor) processOne() {
 
 	queueName := task.queue
 
-	// Check if THIS queue's supervisor is healthy (per-queue check)
-	if state, ok := p.queueStates[queueName]; ok {
+	// Extract parent queue for supervisor health check (sub-queue -> parent)
+	parentQueue := parentQueueName(queueName)
+
+	// Check if parent queue's supervisor is healthy
+	if state, ok := p.queueStates[parentQueue]; ok {
 		if state.Supervisor != nil && !state.Supervisor.IsHealthy() {
-			p.logger.Error("Queue %s is in degraded state - supervised process has crashed", queueName)
+			p.logger.Error("Queue %s is in degraded state - supervised process has crashed", parentQueue)
 			// Fail the task so it can be retried later
-			p.handleError(ctx, task, queueName, fmt.Errorf("queue %s supervisor crashed", queueName))
+			p.handleError(ctx, task, queueName, fmt.Errorf("queue %s supervisor crashed", parentQueue))
 			return
 		}
 	}

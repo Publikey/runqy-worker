@@ -20,6 +20,9 @@ type BootstrapQueueConfig = internalbootstrap.QueueConfig
 // BootstrapDeploymentConfig holds code deployment settings from server.
 type BootstrapDeploymentConfig = internalbootstrap.DeploymentConfig
 
+// BootstrapSubQueueConfig represents a sub-queue with its full name and priority.
+type BootstrapSubQueueConfig = internalbootstrap.SubQueueConfig
+
 // ProcessSupervisor manages a supervised Python FastAPI process.
 type ProcessSupervisor = internalbootstrap.ProcessSupervisor
 

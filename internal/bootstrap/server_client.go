@@ -35,9 +35,10 @@ type Config struct {
 
 // Response contains the configuration received from runqy-server.
 type Response struct {
-	Redis      RedisConfig      `json:"redis"`
-	Queue      QueueConfig      `json:"queue"`
-	Deployment DeploymentConfig `json:"deployment"`
+	Redis      RedisConfig       `json:"redis"`
+	Queue      QueueConfig       `json:"queue"`
+	SubQueues  []SubQueueConfig  `json:"sub_queues"`
+	Deployment DeploymentConfig  `json:"deployment"`
 }
 
 // RedisConfig holds Redis connection settings from server.
@@ -52,6 +53,12 @@ type RedisConfig struct {
 type QueueConfig struct {
 	Name     string `json:"name"`
 	Priority int    `json:"priority"` // Weight for this queue
+}
+
+// SubQueueConfig represents a sub-queue with its full name and priority.
+type SubQueueConfig struct {
+	Name     string `json:"name"`     // Full name: "inference:high"
+	Priority int    `json:"priority"` // Weight for this sub-queue
 }
 
 // DeploymentConfig holds code deployment settings from server.

@@ -18,6 +18,7 @@ import (
 type QueueState struct {
 	Name           string
 	Priority       int
+	SubQueues      []BootstrapSubQueueConfig // Sub-queues for this parent queue
 	Response       *BootstrapResponse
 	Deployment     *DeploymentResult
 	Supervisor     *ProcessSupervisor
@@ -158,10 +159,12 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 		}
 	}
 
-	// Build aggregated queue weights map from all queue states
+	// Build aggregated queue weights map from all SUB-queues
 	w.config.Queues = make(map[string]int)
-	for name, state := range w.queueStates {
-		w.config.Queues[name] = state.Priority
+	for _, state := range w.queueStates {
+		for _, sq := range state.SubQueues {
+			w.config.Queues[sq.Name] = sq.Priority
+		}
 	}
 
 	w.bootstrapped = true
@@ -191,9 +194,21 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 		return nil, fmt.Errorf("code deployment failed: %w", err)
 	}
 
+	// Determine sub-queues from response
+	subQueues := resp.SubQueues
+	if len(subQueues) == 0 {
+		// Backward compatibility: if server doesn't return sub_queues,
+		// create default sub-queue from queue config
+		subQueues = []BootstrapSubQueueConfig{{
+			Name:     queueName + ":default",
+			Priority: resp.Queue.Priority,
+		}}
+	}
+
 	state := &QueueState{
 		Name:       queueName,
 		Priority:   resp.Queue.Priority,
+		SubQueues:  subQueues,
 		Response:   resp,
 		Deployment: deployment,
 		Mode:       resp.Deployment.Mode,
@@ -217,7 +232,10 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 			resp.Deployment.StartupTimeoutSecs,
 			w.logger,
 		)
-		w.HandleQueue(queueName, state.OneShotHandler.ProcessTask)
+		// Register handler for ALL sub-queues
+		for _, sq := range subQueues {
+			w.HandleQueue(sq.Name, state.OneShotHandler.ProcessTask)
+		}
 
 	default: // "long_running"
 		// Long-running mode: single supervised process
@@ -231,10 +249,13 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 		// Create stdio handler for communication with supervised process
 		state.StdioHandler = NewStdioHandler(state.Supervisor.Stdin(), state.Supervisor.Stdout(), w.logger)
 		state.StdioHandler.Start()
-		w.HandleQueue(queueName, state.StdioHandler.ProcessTask)
+		// Register handler for ALL sub-queues
+		for _, sq := range subQueues {
+			w.HandleQueue(sq.Name, state.StdioHandler.ProcessTask)
+		}
 	}
 
-	w.logger.Info("[%s] Bootstrap complete (priority=%d)", queueName, state.Priority)
+	w.logger.Info("[%s] Bootstrap complete with %d sub-queues (priority=%d)", queueName, len(subQueues), state.Priority)
 	return state, nil
 }
 
