@@ -71,7 +71,7 @@ func (s *ProcessSupervisor) Start(ctx context.Context) error {
 
 	// Build the command
 	s.cmd = exec.CommandContext(procCtx, args[0], args[1:]...)
-	s.cmd.Dir = s.deployment.RepoPath
+	s.cmd.Dir = s.deployment.CodePath
 
 	// Build environment
 	s.cmd.Env = s.buildEnvironment()
@@ -98,7 +98,7 @@ func (s *ProcessSupervisor) Start(ctx context.Context) error {
 
 	// Start the process
 	s.logger.Info("Starting process: %s", s.startupCmd)
-	s.logger.Info("Working directory: %s", s.deployment.RepoPath)
+	s.logger.Info("Working directory: %s", s.deployment.CodePath)
 
 	if err := s.cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start process: %w", err)

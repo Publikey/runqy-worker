@@ -58,9 +58,10 @@ type QueueConfig struct {
 type DeploymentConfig struct {
 	GitURL             string            `json:"git_url"`              // Repository URL
 	Branch             string            `json:"branch"`               // Git branch/tag
-	StartupCmd         string            `json:"startup_cmd"`          // Command to start FastAPI
+	CodePath           string            `json:"code_path"`            // Subdirectory where task code lives (enables sparse checkout)
+	StartupCmd         string            `json:"startup_cmd"`          // Command to start process
 	EnvVars            map[string]string `json:"env_vars"`             // Environment variables
-	StartupTimeoutSecs int               `json:"startup_timeout_secs"` // Timeout for "Uvicorn running"
+	StartupTimeoutSecs int               `json:"startup_timeout_secs"` // Timeout for ready signal
 	Mode               string            `json:"mode"`                 // "long_running" (default) or "one_shot"
 }
 

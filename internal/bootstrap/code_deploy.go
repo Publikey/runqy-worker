@@ -14,6 +14,7 @@ import (
 // DeploymentResult contains paths to the deployed code and virtual environment.
 type DeploymentResult struct {
 	RepoPath   string // Path to cloned repository
+	CodePath   string // Path to task code (RepoPath + spec.CodePath, or RepoPath if no CodePath)
 	VenvPath   string // Path to virtual environment
 	VenvPython string // Path to python executable in venv
 }
@@ -32,36 +33,49 @@ func DeployCode(ctx context.Context, config Config, spec DeploymentConfig, logge
 		return nil, fmt.Errorf("failed to resolve deployment directory: %w", err)
 	}
 
-	// Phase 1: Git Clone
+	// Phase 1: Git Clone (with sparse checkout if CodePath is set)
 	repoPath, err := gitClone(ctx, absDeployDir, spec, config, logger)
 	if err != nil {
 		return nil, fmt.Errorf("git clone failed: %w", err)
 	}
 
-	// Phase 2: Detect package manager
-	pkgManager := detectPackageManager(repoPath, logger)
+	// Calculate code path (subdirectory where task code lives)
+	codePath := repoPath
+	if spec.CodePath != "" {
+		codePath = filepath.Join(repoPath, spec.CodePath)
+		// Verify the code path exists
+		if _, err := os.Stat(codePath); os.IsNotExist(err) {
+			return nil, fmt.Errorf("code_path directory does not exist: %s", codePath)
+		}
+		logger.Info("Using code path: %s", codePath)
+	}
 
-	// Phase 3: Create virtual environment
-	venvPath := filepath.Join(repoPath, ".venv")
-	venvPython, err := createVirtualEnv(ctx, repoPath, venvPath, logger)
+	// Phase 2: Detect package manager (in code path)
+	pkgManager := detectPackageManager(codePath, logger)
+
+	// Phase 3: Create virtual environment (in code path)
+	venvPath := filepath.Join(codePath, ".venv")
+	venvPython, err := createVirtualEnv(ctx, codePath, venvPath, logger)
 	if err != nil {
 		return nil, fmt.Errorf("virtualenv creation failed: %w", err)
 	}
 
-	// Phase 4: Install dependencies
-	if err := installDependencies(ctx, repoPath, venvPython, pkgManager, logger); err != nil {
+	// Phase 4: Install dependencies (in code path)
+	if err := installDependencies(ctx, codePath, venvPython, pkgManager, logger); err != nil {
 		return nil, fmt.Errorf("dependency installation failed: %w", err)
 	}
 
-	logger.Info("Code deployment completed: %s", repoPath)
+	logger.Info("Code deployment completed: %s", codePath)
 	return &DeploymentResult{
 		RepoPath:   repoPath,
+		CodePath:   codePath,
 		VenvPath:   venvPath,
 		VenvPython: venvPython,
 	}, nil
 }
 
 // gitClone clones the repository or reuses existing deployment.
+// If spec.CodePath is set, uses sparse checkout to only download that subdirectory.
 func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, config Config, logger Logger) (string, error) {
 	// Check if deployment directory exists
 	info, err := os.Stat(deployDir)
@@ -81,9 +95,6 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 	if err := os.MkdirAll(parentDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create parent directory: %w", err)
 	}
-
-	// Build git clone command
-	args := []string{"clone", "--branch", spec.Branch, "--depth", "1"}
 
 	// Handle authentication
 	gitURL := spec.GitURL
@@ -105,7 +116,13 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 		logger.Info("Using public repository access")
 	}
 
-	args = append(args, gitURL, deployDir)
+	// Use sparse checkout if CodePath is specified
+	if spec.CodePath != "" {
+		return gitCloneSparse(ctx, deployDir, parentDir, spec, gitURL, env, logger)
+	}
+
+	// Regular clone (no CodePath)
+	args := []string{"clone", "--branch", spec.Branch, "--depth", "1", gitURL, deployDir}
 
 	logger.Info("Cloning %s (branch: %s) to %s", spec.GitURL, spec.Branch, deployDir)
 
@@ -121,6 +138,49 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 	}
 
 	logger.Info("Git clone successful")
+	return deployDir, nil
+}
+
+// gitCloneSparse performs a sparse checkout to only download the specified subdirectory.
+func gitCloneSparse(ctx context.Context, deployDir, parentDir string, spec DeploymentConfig, gitURL string, env []string, logger Logger) (string, error) {
+	logger.Info("Sparse checkout: cloning %s (branch: %s, path: %s) to %s",
+		spec.GitURL, spec.Branch, spec.CodePath, deployDir)
+
+	// Step 1: Clone with filter (no blobs) and sparse mode
+	args := []string{
+		"clone",
+		"--filter=blob:none",
+		"--sparse",
+		"--branch", spec.Branch,
+		"--depth", "1",
+		gitURL,
+		deployDir,
+	}
+
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Env = env
+	cmd.Dir = parentDir
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		os.RemoveAll(deployDir)
+		return "", fmt.Errorf("git sparse clone failed: %w\nOutput: %s", err, string(output))
+	}
+
+	// Step 2: Set sparse-checkout to only include the specified path
+	sparseArgs := []string{"sparse-checkout", "set", spec.CodePath}
+
+	sparseCmd := exec.CommandContext(ctx, "git", sparseArgs...)
+	sparseCmd.Env = env
+	sparseCmd.Dir = deployDir
+
+	sparseOutput, err := sparseCmd.CombinedOutput()
+	if err != nil {
+		os.RemoveAll(deployDir)
+		return "", fmt.Errorf("git sparse-checkout set failed: %w\nOutput: %s", err, string(sparseOutput))
+	}
+
+	logger.Info("Sparse checkout successful (only downloaded: %s)", spec.CodePath)
 	return deployDir, nil
 }
 
