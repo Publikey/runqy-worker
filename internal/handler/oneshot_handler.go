@@ -20,6 +20,7 @@ import (
 type OneShotHandler struct {
 	repoPath   string
 	venvPath   string
+	venvPython string
 	startupCmd string
 	envVars    map[string]string
 	timeout    time.Duration
@@ -38,9 +39,19 @@ func NewOneShotHandler(
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
+
+	// Calculate venv python path
+	var venvPython string
+	if runtime.GOOS == "windows" {
+		venvPython = filepath.Join(venvPath, "Scripts", "python.exe")
+	} else {
+		venvPython = filepath.Join(venvPath, "bin", "python")
+	}
+
 	return &OneShotHandler{
 		repoPath:   repoPath,
 		venvPath:   venvPath,
+		venvPython: venvPython,
 		startupCmd: startupCmd,
 		envVars:    envVars,
 		timeout:    timeout,
@@ -57,6 +68,12 @@ func (h *OneShotHandler) ProcessTask(ctx context.Context, task Task) error {
 	args := parseCommand(h.startupCmd)
 	if len(args) == 0 {
 		return fmt.Errorf("empty startup command")
+	}
+
+	// Replace python/python3 with the venv python to avoid Windows PATH issues
+	if len(args) > 0 && (args[0] == "python" || args[0] == "python3" || args[0] == "python.exe" || args[0] == "python3.exe") {
+		args[0] = h.venvPython
+		h.logger.Debug("OneShot: using venv python: %s", args[0])
 	}
 
 	// Create process with timeout context

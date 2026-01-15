@@ -65,6 +65,12 @@ func (s *ProcessSupervisor) Start(ctx context.Context) error {
 		return fmt.Errorf("empty startup command")
 	}
 
+	// Replace python/python3 with the venv python to avoid Windows PATH issues
+	if len(args) > 0 && (args[0] == "python" || args[0] == "python3" || args[0] == "python.exe" || args[0] == "python3.exe") {
+		args[0] = s.deployment.VenvPython
+		s.logger.Debug("Using venv python: %s", args[0])
+	}
+
 	// Create a cancellable context for the process
 	procCtx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
