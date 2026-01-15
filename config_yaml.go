@@ -79,9 +79,10 @@ type AuthConfig struct {
 
 // WorkerConfig holds worker settings from YAML.
 type WorkerConfig struct {
-	Queue           string `yaml:"queue"`            // Single queue name to listen on
-	Concurrency     int    `yaml:"concurrency"`
-	ShutdownTimeout string `yaml:"shutdown_timeout"`
+	Queue           string   `yaml:"queue"`            // DEPRECATED: Single queue name (backward compat)
+	Queues          []string `yaml:"queues"`           // List of queue names to listen on
+	Concurrency     int      `yaml:"concurrency"`
+	ShutdownTimeout string   `yaml:"shutdown_timeout"`
 }
 
 // RetryConfig holds retry settings from YAML.
@@ -144,8 +145,16 @@ func toWorkerConfig(yc *YAMLConfig) Config {
 	cfg.ServerURL = yc.Server.URL
 	cfg.APIKey = yc.Server.APIKey
 
-	// Worker settings
-	cfg.Queue = yc.Worker.Queue
+	// Worker settings - handle both queue (single) and queues (list) for backward compatibility
+	if len(yc.Worker.Queues) > 0 {
+		cfg.QueueNames = yc.Worker.Queues
+	} else if yc.Worker.Queue != "" {
+		cfg.QueueNames = []string{yc.Worker.Queue}
+	}
+	// Keep Queue field for backward compat (use first queue if available)
+	if len(cfg.QueueNames) > 0 {
+		cfg.Queue = cfg.QueueNames[0]
+	}
 	if yc.Worker.Concurrency > 0 {
 		cfg.Concurrency = yc.Worker.Concurrency
 	}

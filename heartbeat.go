@@ -12,30 +12,30 @@ import (
 
 // heartbeat sends periodic heartbeats to Redis to indicate worker is alive.
 type heartbeat struct {
-	rdb        *redis.Client
-	workerID   string
-	interval   time.Duration
-	done       chan struct{}
-	wg         sync.WaitGroup
-	logger     Logger
-	config     Config
-	supervisor *ProcessSupervisor // supervised process (may be nil)
+	rdb         *redis.Client
+	workerID    string
+	interval    time.Duration
+	done        chan struct{}
+	wg          sync.WaitGroup
+	logger      Logger
+	config      Config
+	queueStates map[string]*QueueState // supervised processes (may be nil or empty)
 }
 
 // newHeartbeat creates a new heartbeat sender.
-func newHeartbeat(rdb *redis.Client, cfg Config, supervisor *ProcessSupervisor) *heartbeat {
+func newHeartbeat(rdb *redis.Client, cfg Config, queueStates map[string]*QueueState) *heartbeat {
 	hostname, _ := os.Hostname()
 	pid := os.Getpid()
 	workerID := fmt.Sprintf("%s:%d", hostname, pid)
 
 	return &heartbeat{
-		rdb:        rdb,
-		workerID:   workerID,
-		interval:   5 * time.Second,
-		done:       make(chan struct{}),
-		logger:     cfg.Logger,
-		config:     cfg,
-		supervisor: supervisor,
+		rdb:         rdb,
+		workerID:    workerID,
+		interval:    5 * time.Second,
+		done:        make(chan struct{}),
+		logger:      cfg.Logger,
+		config:      cfg,
+		queueStates: queueStates,
 	}
 }
 
@@ -118,12 +118,17 @@ func (h *heartbeat) beat(ctx context.Context) {
 	h.rdb.SAdd(ctx, keyWorkers, h.workerID)
 }
 
-// isHealthy returns true if the worker and supervised process are healthy.
+// isHealthy returns true if the worker and all supervised processes are healthy.
 func (h *heartbeat) isHealthy() bool {
-	if h.supervisor == nil {
-		return true // No supervisor = worker-only mode, always healthy
+	if h.queueStates == nil || len(h.queueStates) == 0 {
+		return true // No supervisors = worker-only mode, always healthy
 	}
-	return h.supervisor.IsHealthy()
+	for _, state := range h.queueStates {
+		if state.Supervisor != nil && !state.Supervisor.IsHealthy() {
+			return false
+		}
+	}
+	return true
 }
 
 // deregister removes the worker from the registry.

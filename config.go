@@ -8,10 +8,11 @@ import (
 // Config holds the configuration for a Worker.
 type Config struct {
 	// Server Bootstrap (required for dynamic configuration)
-	ServerURL string // Required: runqy-server URL (e.g., "https://server.example.com")
-	APIKey    string // Required: Authentication key for server
-	Queue     string // Required: Single queue name to listen on
-	Version   string // Worker version (for registration metadata)
+	ServerURL  string   // Required: runqy-server URL (e.g., "https://server.example.com")
+	APIKey     string   // Required: Authentication key for server
+	Queue      string   // DEPRECATED: Single queue name (backward compat, set to first queue)
+	QueueNames []string // List of queue names to bootstrap and listen on
+	Version    string   // Worker version (for registration metadata)
 
 	// Bootstrap Retry
 	BootstrapRetries    int           // Number of retries for server contact (default: 3)

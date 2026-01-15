@@ -6,12 +6,25 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// QueueState holds the bootstrap state for a single queue.
+type QueueState struct {
+	Name           string
+	Priority       int
+	Response       *BootstrapResponse
+	Deployment     *DeploymentResult
+	Supervisor     *ProcessSupervisor
+	StdioHandler   *StdioHandler
+	OneShotHandler *OneShotHandler
+	Mode           string // "long_running" or "one_shot"
+}
 
 // Worker processes tasks from Redis queues.
 type Worker struct {
@@ -22,11 +35,9 @@ type Worker struct {
 	heartbeat     *heartbeat
 	queueHandlers map[string]HandlerFunc // stored until processor is created
 
-	// Bootstrap state
-	bootstrapResponse *BootstrapResponse
-	supervisor        *ProcessSupervisor
-	stdioHandler      *StdioHandler
-	bootstrapped      bool
+	// Multi-queue bootstrap state
+	queueStates  map[string]*QueueState
+	bootstrapped bool
 
 	done   chan struct{}
 	wg     sync.WaitGroup
@@ -92,10 +103,10 @@ func NewWithTLS(cfg Config) *Worker {
 	return New(cfg)
 }
 
-// Bootstrap contacts the runqy-server, deploys code, and starts the supervised process.
+// Bootstrap contacts the runqy-server, deploys code, and starts supervised processes for all queues.
 // This must be called before Run() when using server-driven configuration.
 func (w *Worker) Bootstrap(ctx context.Context) error {
-	w.logger.Info("Starting bootstrap process...")
+	w.logger.Info("Starting multi-queue bootstrap process...")
 
 	// Validate required config
 	if w.config.ServerURL == "" {
@@ -104,62 +115,101 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 	if w.config.APIKey == "" {
 		return fmt.Errorf("APIKey is required for bootstrap")
 	}
-	if w.config.Queue == "" {
-		return fmt.Errorf("Queue is required for bootstrap")
+	if len(w.config.QueueNames) == 0 {
+		return fmt.Errorf("at least one queue is required for bootstrap")
 	}
 
-	// Phase 1: Contact server
-	w.logger.Info("Contacting server at %s...", w.config.ServerURL)
-	resp, err := doBootstrap(ctx, w.config, w.logger)
-	if err != nil {
-		return fmt.Errorf("server bootstrap failed: %w", err)
-	}
-	w.bootstrapResponse = resp
+	w.queueStates = make(map[string]*QueueState)
 
-	// Phase 2: Create Redis client from server config
-	w.logger.Info("Connecting to Redis at %s...", resp.Redis.Addr)
-	opts := &redis.Options{
-		Addr:     resp.Redis.Addr,
-		Password: resp.Redis.Password,
-		DB:       resp.Redis.DB,
-	}
-	if resp.Redis.UseTLS {
-		opts.TLSConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
+	// Bootstrap each queue
+	for i, queueName := range w.config.QueueNames {
+		w.logger.Info("Bootstrapping queue %d/%d: %s", i+1, len(w.config.QueueNames), queueName)
+
+		state, err := w.bootstrapQueue(ctx, queueName)
+		if err != nil {
+			// Clean up already-bootstrapped queues
+			w.cleanupQueueStates()
+			return fmt.Errorf("failed to bootstrap queue %s: %w", queueName, err)
+		}
+
+		w.queueStates[queueName] = state
+
+		// Create Redis client from first queue response (all should have same Redis config)
+		if w.rdb == nil {
+			w.logger.Info("Connecting to Redis at %s...", state.Response.Redis.Addr)
+			opts := &redis.Options{
+				Addr:     state.Response.Redis.Addr,
+				Password: state.Response.Redis.Password,
+				DB:       state.Response.Redis.DB,
+			}
+			if state.Response.Redis.UseTLS {
+				opts.TLSConfig = &tls.Config{
+					MinVersion: tls.VersionTLS12,
+				}
+			}
+			w.rdb = redis.NewClient(opts)
+
+			// Test Redis connection
+			if err := w.rdb.Ping(ctx).Err(); err != nil {
+				w.cleanupQueueStates()
+				return fmt.Errorf("failed to connect to Redis: %w", err)
+			}
+			w.logger.Info("Redis connection successful")
 		}
 	}
-	w.rdb = redis.NewClient(opts)
 
-	// Test Redis connection
-	if err := w.rdb.Ping(ctx).Err(); err != nil {
-		return fmt.Errorf("failed to connect to Redis: %w", err)
-	}
-	w.logger.Info("Redis connection successful")
-
-	// Phase 3: Build queue configuration
-	w.config.Queues = map[string]int{
-		resp.Queue.Name: resp.Queue.Priority,
+	// Build aggregated queue weights map from all queue states
+	w.config.Queues = make(map[string]int)
+	for name, state := range w.queueStates {
+		w.config.Queues[name] = state.Priority
 	}
 
-	// Phase 4: Deploy code
-	w.logger.Info("Deploying code from %s (branch: %s)...", resp.Deployment.GitURL, resp.Deployment.Branch)
-	deployment, err := deployCode(ctx, w.config, resp.Deployment, w.logger)
+	w.bootstrapped = true
+	w.logger.Info("Multi-queue bootstrap completed: %d queues", len(w.queueStates))
+	return nil
+}
+
+// bootstrapQueue handles bootstrap for a single queue.
+func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueState, error) {
+	// Create queue-specific config for bootstrap
+	queueConfig := w.config
+	queueConfig.Queue = queueName
+	// Use unique deployment dir per queue
+	queueConfig.DeploymentDir = filepath.Join(w.config.DeploymentDir, queueName)
+
+	// Phase 1: Contact server for this queue
+	w.logger.Info("[%s] Contacting server...", queueName)
+	resp, err := doBootstrap(ctx, queueConfig, w.logger)
 	if err != nil {
-		return fmt.Errorf("code deployment failed: %w", err)
+		return nil, fmt.Errorf("server bootstrap failed: %w", err)
 	}
 
-	// Phase 5: Set up task handler based on deployment mode
-	mode := resp.Deployment.Mode
-	if mode == "" {
-		mode = "long_running" // Default for backward compatibility
+	// Phase 2: Deploy code for this queue
+	w.logger.Info("[%s] Deploying code from %s (branch: %s)...", queueName, resp.Deployment.GitURL, resp.Deployment.Branch)
+	deployment, err := deployCode(ctx, queueConfig, resp.Deployment, w.logger)
+	if err != nil {
+		return nil, fmt.Errorf("code deployment failed: %w", err)
 	}
-	w.logger.Info("Deployment mode: %s", mode)
 
-	switch mode {
+	state := &QueueState{
+		Name:       queueName,
+		Priority:   resp.Queue.Priority,
+		Response:   resp,
+		Deployment: deployment,
+		Mode:       resp.Deployment.Mode,
+	}
+	if state.Mode == "" {
+		state.Mode = "long_running"
+	}
+
+	// Phase 3: Set up handler based on mode
+	w.logger.Info("[%s] Deployment mode: %s", queueName, state.Mode)
+
+	switch state.Mode {
 	case "one_shot":
 		// One-shot mode: spawn new process per task
-		w.logger.Info("Setting up one-shot handler (new process per task)...")
-		oneShotHandler := NewOneShotHandler(
+		w.logger.Info("[%s] Setting up one-shot handler...", queueName)
+		state.OneShotHandler = NewOneShotHandler(
 			deployment.RepoPath,
 			deployment.VenvPath,
 			resp.Deployment.StartupCmd,
@@ -167,29 +217,39 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 			resp.Deployment.StartupTimeoutSecs,
 			w.logger,
 		)
-		w.HandleDefault(oneShotHandler.ProcessTask)
-		w.logger.Info("One-shot handler configured as default task handler")
+		w.HandleQueue(queueName, state.OneShotHandler.ProcessTask)
 
-	default: // "long_running" or unrecognized (backward compatible)
+	default: // "long_running"
 		// Long-running mode: single supervised process
-		w.logger.Info("Starting supervised process...")
-		w.supervisor = newProcessSupervisor(deployment, resp.Deployment, w.logger)
-		if err := w.supervisor.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start process: %w", err)
+		w.logger.Info("[%s] Starting supervised process...", queueName)
+		state.Supervisor = newProcessSupervisor(deployment, resp.Deployment, w.logger)
+		if err := state.Supervisor.Start(ctx); err != nil {
+			return nil, fmt.Errorf("failed to start process: %w", err)
 		}
-		w.logger.Info("Supervised process started and ready")
+		w.logger.Info("[%s] Supervised process started and ready", queueName)
 
 		// Create stdio handler for communication with supervised process
-		w.logger.Info("Setting up stdio handler for task communication...")
-		w.stdioHandler = NewStdioHandler(w.supervisor.Stdin(), w.supervisor.Stdout(), w.logger)
-		w.stdioHandler.Start()
-		w.HandleDefault(w.stdioHandler.ProcessTask)
-		w.logger.Info("Stdio handler configured as default task handler")
+		state.StdioHandler = NewStdioHandler(state.Supervisor.Stdin(), state.Supervisor.Stdout(), w.logger)
+		state.StdioHandler.Start()
+		w.HandleQueue(queueName, state.StdioHandler.ProcessTask)
 	}
 
-	w.bootstrapped = true
-	w.logger.Info("Bootstrap completed successfully")
-	return nil
+	w.logger.Info("[%s] Bootstrap complete (priority=%d)", queueName, state.Priority)
+	return state, nil
+}
+
+// cleanupQueueStates cleans up all bootstrapped queue states.
+func (w *Worker) cleanupQueueStates() {
+	for name, state := range w.queueStates {
+		if state.StdioHandler != nil {
+			state.StdioHandler.Stop()
+		}
+		if state.Supervisor != nil {
+			state.Supervisor.Stop()
+		}
+		deployDir := filepath.Join(w.config.DeploymentDir, name)
+		os.RemoveAll(deployDir)
+	}
 }
 
 // IsBootstrapped returns true if Bootstrap() has been called successfully.
@@ -197,9 +257,51 @@ func (w *Worker) IsBootstrapped() bool {
 	return w.bootstrapped
 }
 
-// Supervisor returns the process supervisor (nil if not bootstrapped).
-func (w *Worker) Supervisor() *ProcessSupervisor {
-	return w.supervisor
+// Supervisor returns the process supervisor for a specific queue.
+// Returns nil if queue not found or not bootstrapped.
+func (w *Worker) Supervisor(queueName string) *ProcessSupervisor {
+	if state, ok := w.queueStates[queueName]; ok {
+		return state.Supervisor
+	}
+	return nil
+}
+
+// QueueStates returns the map of all queue states.
+func (w *Worker) QueueStates() map[string]*QueueState {
+	return w.queueStates
+}
+
+// IsQueueHealthy returns true if a specific queue's supervisor is healthy.
+func (w *Worker) IsQueueHealthy(queueName string) bool {
+	state, ok := w.queueStates[queueName]
+	if !ok {
+		return false
+	}
+	if state.Supervisor == nil {
+		return true // one_shot mode, always healthy
+	}
+	return state.Supervisor.IsHealthy()
+}
+
+// IsAllQueuesHealthy returns true if ALL supervisors are healthy.
+func (w *Worker) IsAllQueuesHealthy() bool {
+	for _, state := range w.queueStates {
+		if state.Supervisor != nil && !state.Supervisor.IsHealthy() {
+			return false
+		}
+	}
+	return true
+}
+
+// GetUnhealthyQueues returns list of queue names that are not healthy.
+func (w *Worker) GetUnhealthyQueues() []string {
+	var unhealthy []string
+	for name, state := range w.queueStates {
+		if state.Supervisor != nil && !state.Supervisor.IsHealthy() {
+			unhealthy = append(unhealthy, name)
+		}
+	}
+	return unhealthy
 }
 
 // Handle registers a handler for the given task type.
@@ -250,27 +352,28 @@ func (w *Worker) Run() error {
 		return fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
-	// Check supervisor health if bootstrapped
-	if w.supervisor != nil && !w.supervisor.IsHealthy() {
-		return fmt.Errorf("supervised process is not healthy")
+	// Check all queue supervisors health if bootstrapped
+	if w.bootstrapped {
+		unhealthy := w.GetUnhealthyQueues()
+		if len(unhealthy) > 0 {
+			return fmt.Errorf("supervised processes are not healthy: %v", unhealthy)
+		}
 	}
 
 	w.logger.Info("Worker starting...")
 	w.logger.Info(fmt.Sprintf("Concurrency: %d", w.config.Concurrency))
 	w.logger.Info(fmt.Sprintf("Queues: %v", w.config.Queues))
 	if w.bootstrapped {
-		w.logger.Info("Mode: bootstrapped (server-driven)")
+		w.logger.Info("Mode: bootstrapped (server-driven, %d queues)", len(w.queueStates))
 	}
 
 	// Create components
 	redisClient := newRedisClient(w.rdb, w.logger)
 	w.processor = newProcessor(redisClient, w.mux, w.config)
-	w.heartbeat = newHeartbeat(w.rdb, w.config, w.supervisor)
+	w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates)
 
-	// Set supervisor for health checks
-	if w.supervisor != nil {
-		w.processor.SetSupervisor(w.supervisor)
-	}
+	// Set queue states for per-queue health checks
+	w.processor.SetQueueStates(w.queueStates)
 
 	// Copy queue handlers to processor
 	for queue, handler := range w.queueHandlers {
@@ -310,9 +413,12 @@ func (w *Worker) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 
-	// Check supervisor health if bootstrapped
-	if w.supervisor != nil && !w.supervisor.IsHealthy() {
-		return fmt.Errorf("supervised process is not healthy")
+	// Check all queue supervisors health if bootstrapped
+	if w.bootstrapped {
+		unhealthy := w.GetUnhealthyQueues()
+		if len(unhealthy) > 0 {
+			return fmt.Errorf("supervised processes are not healthy: %v", unhealthy)
+		}
 	}
 
 	w.logger.Info("Worker starting...")
@@ -322,12 +428,10 @@ func (w *Worker) Start(ctx context.Context) error {
 	// Create components
 	redisClient := newRedisClient(w.rdb, w.logger)
 	w.processor = newProcessor(redisClient, w.mux, w.config)
-	w.heartbeat = newHeartbeat(w.rdb, w.config, w.supervisor)
+	w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates)
 
-	// Set supervisor for health checks
-	if w.supervisor != nil {
-		w.processor.SetSupervisor(w.supervisor)
-	}
+	// Set queue states for per-queue health checks
+	w.processor.SetQueueStates(w.queueStates)
 
 	// Copy queue handlers to processor
 	for queue, handler := range w.queueHandlers {
@@ -370,21 +474,21 @@ func (w *Worker) shutdown() error {
 		w.heartbeat.stop()
 	}
 
-	// Stop stdio handler
-	if w.stdioHandler != nil {
-		w.logger.Info("Stopping stdio handler...")
-		w.stdioHandler.Stop()
-	}
-
-	// Stop supervised process
-	if w.supervisor != nil {
-		w.logger.Info("Stopping supervised process...")
-		if err := w.supervisor.Stop(); err != nil {
-			w.logger.Error("Error stopping supervised process:", err)
+	// Stop all queue handlers and supervisors
+	for name, state := range w.queueStates {
+		if state.StdioHandler != nil {
+			w.logger.Info("Stopping stdio handler for queue: %s", name)
+			state.StdioHandler.Stop()
+		}
+		if state.Supervisor != nil {
+			w.logger.Info("Stopping supervised process for queue: %s", name)
+			if err := state.Supervisor.Stop(); err != nil {
+				w.logger.Error("Error stopping supervisor for queue %s: %v", name, err)
+			}
 		}
 	}
 
-	// Clean up deployment directory
+	// Clean up deployment directories
 	if w.bootstrapped && w.config.DeploymentDir != "" {
 		w.logger.Info("Cleaning up deployment directory: %s", w.config.DeploymentDir)
 		if err := os.RemoveAll(w.config.DeploymentDir); err != nil {

@@ -53,7 +53,7 @@ func main() {
 	// Bootstrap: contact server, deploy code, start Python process
 	log.Printf("Starting runqy-worker %s...", Version)
 	log.Printf("  Server: %s", cfg.ServerURL)
-	log.Printf("  Queue: %s", cfg.Queue)
+	log.Printf("  Queues: %v", cfg.QueueNames)
 	log.Printf("  Concurrency: %d", cfg.Concurrency)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -86,8 +86,8 @@ func validateConfig(cfg *worker.Config) error {
 	if cfg.APIKey == "" {
 		return fmt.Errorf("server.api_key is required")
 	}
-	if cfg.Queue == "" {
-		return fmt.Errorf("worker.queue is required")
+	if len(cfg.QueueNames) == 0 {
+		return fmt.Errorf("worker.queues (or worker.queue) is required")
 	}
 	if cfg.Concurrency <= 0 {
 		return fmt.Errorf("worker.concurrency must be > 0")

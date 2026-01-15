@@ -10,11 +10,11 @@ import (
 // processor handles dequeuing and executing tasks.
 type processor struct {
 	redis         *redisClient
-	handler       Handler                    // fallback handler (ServeMux for type-based routing)
-	queueHandlers map[string]HandlerFunc     // queue name -> handler (for queue-based routing)
+	handler       Handler                // fallback handler (ServeMux for type-based routing)
+	queueHandlers map[string]HandlerFunc // queue name -> handler (for queue-based routing)
 	config        Config
-	queues        []string // Queue names in priority order
-	supervisor    *ProcessSupervisor         // supervised process (may be nil)
+	queues        []string                   // Queue names in priority order
+	queueStates   map[string]*QueueState     // supervised processes per queue (may be nil)
 
 	done   chan struct{}
 	wg     sync.WaitGroup
@@ -42,9 +42,9 @@ func (p *processor) SetQueueHandler(queue string, handler HandlerFunc) {
 	p.queueHandlers[queue] = handler
 }
 
-// SetSupervisor sets the process supervisor for health checks.
-func (p *processor) SetSupervisor(supervisor *ProcessSupervisor) {
-	p.supervisor = supervisor
+// SetQueueStates sets the queue states for per-queue health checks.
+func (p *processor) SetQueueStates(queueStates map[string]*QueueState) {
+	p.queueStates = queueStates
 }
 
 // buildQueueList creates a weighted list of queues for round-robin selection.
@@ -91,13 +91,6 @@ func (p *processor) worker(id int) {
 
 // processOne attempts to dequeue and process a single task.
 func (p *processor) processOne() {
-	// Check if supervised process is healthy
-	if p.supervisor != nil && !p.supervisor.IsHealthy() {
-		p.logger.Error("Worker in degraded state - supervised process has crashed")
-		time.Sleep(5 * time.Second)
-		return
-	}
-
 	ctx := context.Background()
 
 	// Dequeue a task
@@ -115,7 +108,15 @@ func (p *processor) processOne() {
 
 	queueName := task.queue
 
-	// Context is set by the task during dequeue
+	// Check if THIS queue's supervisor is healthy (per-queue check)
+	if state, ok := p.queueStates[queueName]; ok {
+		if state.Supervisor != nil && !state.Supervisor.IsHealthy() {
+			p.logger.Error("Queue %s is in degraded state - supervised process has crashed", queueName)
+			// Fail the task so it can be retried later
+			p.handleError(ctx, task, queueName, fmt.Errorf("queue %s supervisor crashed", queueName))
+			return
+		}
+	}
 
 	p.logger.Info(fmt.Sprintf("Processing task %s (queue=%s, type=%s, retry=%d)", task.id, queueName, task.typename, task.retry))
 
