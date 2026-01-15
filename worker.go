@@ -210,7 +210,7 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 		// One-shot mode: spawn new process per task
 		w.logger.Info("[%s] Setting up one-shot handler...", queueName)
 		state.OneShotHandler = NewOneShotHandler(
-			deployment.RepoPath,
+			deployment.CodePath, // Use CodePath (includes code_path subdirectory)
 			deployment.VenvPath,
 			resp.Deployment.StartupCmd,
 			resp.Deployment.EnvVars,
@@ -474,17 +474,19 @@ func (w *Worker) shutdown() error {
 		w.heartbeat.stop()
 	}
 
-	// Stop all queue handlers and supervisors
+	// Stop all queue supervisors and handlers
+	// IMPORTANT: Stop supervisor FIRST (kills process, closes stdout)
+	// then stop StdioHandler (which waits for stdout to close)
 	for name, state := range w.queueStates {
-		if state.StdioHandler != nil {
-			w.logger.Info("Stopping stdio handler for queue: %s", name)
-			state.StdioHandler.Stop()
-		}
 		if state.Supervisor != nil {
 			w.logger.Info("Stopping supervised process for queue: %s", name)
 			if err := state.Supervisor.Stop(); err != nil {
 				w.logger.Error("Error stopping supervisor for queue %s: %v", name, err)
 			}
+		}
+		if state.StdioHandler != nil {
+			w.logger.Info("Stopping stdio handler for queue: %s", name)
+			state.StdioHandler.Stop()
 		}
 	}
 

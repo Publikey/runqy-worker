@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -94,9 +95,9 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 	queueKey := result[0]
 	taskID := result[1]
 
-	// Extract queue name from key
-	var queueName string
-	fmt.Sscanf(queueKey, KeyPrefix+"%s:pending", &queueName)
+	// Extract queue name from key (e.g., "asynq:inference:pending" -> "inference")
+	queueName := strings.TrimPrefix(queueKey, KeyPrefix)
+	queueName = strings.TrimSuffix(queueName, ":pending")
 
 	// Get task data from hash
 	taskKey := fmt.Sprintf(KeyTask, taskID)
