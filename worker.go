@@ -384,6 +384,14 @@ func (w *Worker) shutdown() error {
 		}
 	}
 
+	// Clean up deployment directory
+	if w.bootstrapped && w.config.DeploymentDir != "" {
+		w.logger.Info("Cleaning up deployment directory: %s", w.config.DeploymentDir)
+		if err := os.RemoveAll(w.config.DeploymentDir); err != nil {
+			w.logger.Error("Error cleaning up deployment directory:", err)
+		}
+	}
+
 	w.logger.Info("Closing Redis connection...")
 	if w.rdb != nil {
 		if err := w.rdb.Close(); err != nil {
