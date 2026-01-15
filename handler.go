@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/publikey/runqy-worker/internal/handler"
 )
@@ -115,6 +116,42 @@ func (h *StdioHandler) Stop() {
 
 // ProcessTask sends a task to the child process and waits for the response.
 func (h *StdioHandler) ProcessTask(ctx context.Context, task *Task) error {
+	return h.internal.ProcessTask(ctx, task)
+}
+
+// OneShotHandler spawns a new process for each task.
+// The process handles one task and exits.
+type OneShotHandler struct {
+	internal *handler.OneShotHandler
+}
+
+// NewOneShotHandler creates an OneShotHandler.
+func NewOneShotHandler(
+	repoPath string,
+	venvPath string,
+	startupCmd string,
+	envVars map[string]string,
+	timeoutSecs int,
+	logger Logger,
+) *OneShotHandler {
+	timeout := time.Duration(timeoutSecs) * time.Second
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	return &OneShotHandler{
+		internal: handler.NewOneShotHandler(
+			repoPath,
+			venvPath,
+			startupCmd,
+			envVars,
+			timeout,
+			&loggerAdapter{logger},
+		),
+	}
+}
+
+// ProcessTask spawns a new process, sends the task, and waits for response.
+func (h *OneShotHandler) ProcessTask(ctx context.Context, task *Task) error {
 	return h.internal.ProcessTask(ctx, task)
 }
 

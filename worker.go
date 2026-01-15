@@ -148,20 +148,44 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 		return fmt.Errorf("code deployment failed: %w", err)
 	}
 
-	// Phase 5: Start supervised process
-	w.logger.Info("Starting supervised process...")
-	w.supervisor = newProcessSupervisor(deployment, resp.Deployment, w.logger)
-	if err := w.supervisor.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start process: %w", err)
+	// Phase 5: Set up task handler based on deployment mode
+	mode := resp.Deployment.Mode
+	if mode == "" {
+		mode = "long_running" // Default for backward compatibility
 	}
-	w.logger.Info("Supervised process started and ready")
+	w.logger.Info("Deployment mode: %s", mode)
 
-	// Phase 6: Create stdio handler for communication with supervised process
-	w.logger.Info("Setting up stdio handler for task communication...")
-	w.stdioHandler = NewStdioHandler(w.supervisor.Stdin(), w.supervisor.Stdout(), w.logger)
-	w.stdioHandler.Start()
-	w.HandleDefault(w.stdioHandler.ProcessTask)
-	w.logger.Info("Stdio handler configured as default task handler")
+	switch mode {
+	case "one_shot":
+		// One-shot mode: spawn new process per task
+		w.logger.Info("Setting up one-shot handler (new process per task)...")
+		oneShotHandler := NewOneShotHandler(
+			deployment.RepoPath,
+			deployment.VenvPath,
+			resp.Deployment.StartupCmd,
+			resp.Deployment.EnvVars,
+			resp.Deployment.StartupTimeoutSecs,
+			w.logger,
+		)
+		w.HandleDefault(oneShotHandler.ProcessTask)
+		w.logger.Info("One-shot handler configured as default task handler")
+
+	default: // "long_running" or unrecognized (backward compatible)
+		// Long-running mode: single supervised process
+		w.logger.Info("Starting supervised process...")
+		w.supervisor = newProcessSupervisor(deployment, resp.Deployment, w.logger)
+		if err := w.supervisor.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start process: %w", err)
+		}
+		w.logger.Info("Supervised process started and ready")
+
+		// Create stdio handler for communication with supervised process
+		w.logger.Info("Setting up stdio handler for task communication...")
+		w.stdioHandler = NewStdioHandler(w.supervisor.Stdin(), w.supervisor.Stdout(), w.logger)
+		w.stdioHandler.Start()
+		w.HandleDefault(w.stdioHandler.ProcessTask)
+		w.logger.Info("Stdio handler configured as default task handler")
+	}
 
 	w.bootstrapped = true
 	w.logger.Info("Bootstrap completed successfully")
