@@ -106,7 +106,7 @@ func (p *processor) processOne() {
 	// Dequeue a task
 	task, err := p.redis.dequeue(ctx, p.queues)
 	if err != nil {
-		p.logger.Error("Dequeue error:", err)
+		p.logger.Error("Dequeue error: %v", err)
 		time.Sleep(time.Second) // Back off on error
 		return
 	}
@@ -152,7 +152,7 @@ func (p *processor) processOne() {
 // handleSuccess handles successful task completion.
 func (p *processor) handleSuccess(ctx context.Context, task *Task, queueName string) {
 	if err := p.redis.complete(ctx, task, queueName); err != nil {
-		p.logger.Error("Failed to mark task complete:", err)
+		p.logger.Error("Failed to mark task complete: %v", err)
 	}
 	p.logger.Info(fmt.Sprintf("Task %s completed successfully", task.id))
 }
@@ -165,7 +165,7 @@ func (p *processor) handleError(ctx context.Context, task *Task, queueName strin
 	if IsSkipRetry(err) {
 		p.logger.Warn(fmt.Sprintf("Task %s marked as permanent failure, skipping retry", task.id))
 		if failErr := p.redis.fail(ctx, task, queueName, err.Error()); failErr != nil {
-			p.logger.Error("Failed to mark task as failed:", failErr)
+			p.logger.Error("Failed to mark task as failed: %v", failErr)
 		}
 		return
 	}
@@ -183,13 +183,13 @@ func (p *processor) handleError(ctx context.Context, task *Task, queueName strin
 		p.logger.Info(fmt.Sprintf("Task %s will retry in %v (attempt %d/%d)", task.id, delay, task.retry+1, task.maxRetry))
 
 		if retryErr := p.redis.retry(ctx, task, queueName, delay); retryErr != nil {
-			p.logger.Error("Failed to schedule retry:", retryErr)
+			p.logger.Error("Failed to schedule retry: %v", retryErr)
 		}
 	} else {
 		p.logger.Warn(fmt.Sprintf("Task %s exceeded max retries (%d), marking as failed", task.id, task.maxRetry))
 
 		if failErr := p.redis.fail(ctx, task, queueName, err.Error()); failErr != nil {
-			p.logger.Error("Failed to mark task as failed:", failErr)
+			p.logger.Error("Failed to mark task as failed: %v", failErr)
 		}
 	}
 }

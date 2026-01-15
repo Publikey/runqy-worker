@@ -99,7 +99,7 @@ func (h *heartbeat) register(ctx context.Context) {
 	h.rdb.HSet(ctx, workerKey, data)
 	h.rdb.Expire(ctx, workerKey, 30*time.Second)
 
-	h.logger.Info("Worker registered:", h.workerID)
+	h.logger.Info("Worker registered: %s", h.workerID)
 }
 
 // beat updates the worker's last heartbeat time.
@@ -138,5 +138,5 @@ func (h *heartbeat) deregister(ctx context.Context) {
 	workerKey := fmt.Sprintf(keyWorkerData, h.workerID)
 	h.rdb.HSet(ctx, workerKey, "status", "stopped")
 
-	h.logger.Info("Worker deregistered:", h.workerID)
+	h.logger.Info("Worker deregistered: %s", h.workerID)
 }

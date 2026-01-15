@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -383,7 +385,7 @@ func (w *Worker) Run() error {
 
 	w.logger.Info("Worker starting...")
 	w.logger.Info(fmt.Sprintf("Concurrency: %d", w.config.Concurrency))
-	w.logger.Info(fmt.Sprintf("Queues: %v", w.config.Queues))
+	w.logger.Info("Queues: %s", formatQueues(w.config.Queues))
 	if w.bootstrapped {
 		w.logger.Info("Mode: bootstrapped (server-driven, %d queues)", len(w.queueStates))
 	}
@@ -444,7 +446,7 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	w.logger.Info("Worker starting...")
 	w.logger.Info(fmt.Sprintf("Concurrency: %d", w.config.Concurrency))
-	w.logger.Info(fmt.Sprintf("Queues: %v", w.config.Queues))
+	w.logger.Info("Queues: %s", formatQueues(w.config.Queues))
 
 	// Create components
 	redisClient := newRedisClient(w.rdb, w.logger)
@@ -515,14 +517,14 @@ func (w *Worker) shutdown() error {
 	if w.bootstrapped && w.config.DeploymentDir != "" {
 		w.logger.Info("Cleaning up deployment directory: %s", w.config.DeploymentDir)
 		if err := os.RemoveAll(w.config.DeploymentDir); err != nil {
-			w.logger.Error("Error cleaning up deployment directory:", err)
+			w.logger.Error("Error cleaning up deployment directory: %v", err)
 		}
 	}
 
 	w.logger.Info("Closing Redis connection...")
 	if w.rdb != nil {
 		if err := w.rdb.Close(); err != nil {
-			w.logger.Error("Error closing Redis:", err)
+			w.logger.Error("Error closing Redis: %v", err)
 		}
 	}
 
@@ -533,4 +535,32 @@ func (w *Worker) shutdown() error {
 // GetServeMux returns the underlying ServeMux for advanced configuration.
 func (w *Worker) GetServeMux() *ServeMux {
 	return w.mux
+}
+
+// formatQueues formats the queue weights map for display.
+// Output: "inference:high (9), simple:default (3), inference:low (1)"
+func formatQueues(queues map[string]int) string {
+	if len(queues) == 0 {
+		return "(none)"
+	}
+
+	// Sort by priority descending
+	type qp struct {
+		name     string
+		priority int
+	}
+	var pairs []qp
+	for name, priority := range queues {
+		pairs = append(pairs, qp{name, priority})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i].priority > pairs[j].priority
+	})
+
+	// Format as "name (priority), ..."
+	var parts []string
+	for _, p := range pairs {
+		parts = append(parts, fmt.Sprintf("%s (%d)", p.name, p.priority))
+	}
+	return strings.Join(parts, ", ")
 }
