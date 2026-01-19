@@ -81,7 +81,8 @@ func (h *heartbeat) loop() {
 // register adds the worker to the workers set.
 func (h *heartbeat) register(ctx context.Context) {
 	// Add to workers set with TTL
-	h.rdb.SAdd(ctx, keyWorkers, h.workerID)
+	leaseExpiration := float64(time.Now().Add(30 * time.Minute).Unix())
+	h.rdb.ZAdd(ctx, keyWorkers, redis.Z{Score: leaseExpiration, Member: h.workerID})
 
 	// Store worker info
 	workerKey := fmt.Sprintf(keyWorkerData, h.workerID)
@@ -115,7 +116,9 @@ func (h *heartbeat) beat(ctx context.Context) {
 	h.rdb.Expire(ctx, workerKey, 30*time.Second)
 
 	// Renew membership in workers set
-	h.rdb.SAdd(ctx, keyWorkers, h.workerID)
+	leaseExpiration := float64(time.Now().Add(30 * time.Minute).Unix())
+	h.rdb.ZAdd(ctx, keyWorkers, redis.Z{Score: leaseExpiration, Member: h.workerID})
+
 }
 
 // isHealthy returns true if the worker and all supervised processes are healthy.

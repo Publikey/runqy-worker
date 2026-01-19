@@ -75,7 +75,7 @@ func New(cfg Config) *Worker {
 
 	// Redis client is created during Bootstrap() or can be set directly
 	var rdb *redis.Client
-	if cfg.RedisAddr != "" {
+	if cfg.RedisAddr != "" && cfg.ServerURL == "" {
 		opts := &redis.Options{
 			Addr:     cfg.RedisAddr,
 			Password: cfg.RedisPassword,

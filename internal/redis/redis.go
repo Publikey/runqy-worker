@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,55 +13,70 @@ import (
 
 // Logger interface for redis package logging.
 type Logger interface {
-	Info(format string, args ...interface{})
-	Warn(format string, args ...interface{})
-	Error(format string, args ...interface{})
-	Debug(format string, args ...interface{})
+	Info(format string, args ...any)
+	Warn(format string, args ...any)
+	Error(format string, args ...any)
+	Debug(format string, args ...any)
 }
 
 // Redis key prefixes (asynq-compatible)
+// Queue names are wrapped in {} for Redis Cluster hash slot compatibility
 const (
 	KeyPrefix     = "asynq:"
-	KeyPending    = KeyPrefix + "%s:pending"    // List of pending task IDs
-	KeyActive     = KeyPrefix + "%s:active"     // List of active task IDs
-	KeyTask       = KeyPrefix + "t:%s"          // Task data hash
-	KeyResult     = KeyPrefix + "result:%s"     // Task result
-	KeyWorkers    = KeyPrefix + "workers"       // Set of worker IDs
-	KeyWorkerData = KeyPrefix + "workers:%s"    // Worker data hash
+	KeyPending    = KeyPrefix + "{%s}:pending"   // List of pending task IDs
+	KeyActive     = KeyPrefix + "{%s}:active"    // Sorted set of active task IDs (score = lease expiration)
+	KeyScheduled  = KeyPrefix + "{%s}:scheduled" // Sorted set of scheduled task IDs
+	KeyRetry      = KeyPrefix + "{%s}:retry"     // Sorted set of retry task IDs (score = retry time)
+	KeyCompleted  = KeyPrefix + "{%s}:completed" // Sorted set of completed task IDs
+	KeyArchived   = KeyPrefix + "{%s}:archived"  // Sorted set of failed/archived task IDs
+	KeyTask       = KeyPrefix + "{%s}:t:%s"      // Task data hash: asynq:{queue}:t:{taskID}
+	KeyWorkers    = KeyPrefix + "workers"        // Set of worker IDs
+	KeyWorkerData = KeyPrefix + "workers:%s"     // Worker data hash
 )
 
 // Task data fields in Redis hash (asynq-compatible)
 const (
-	FieldType         = "type"
-	FieldPayload      = "payload"
-	FieldState        = "state"
-	FieldRetry        = "retry"
-	FieldMaxRetry     = "max_retry"
-	FieldQueue        = "queue"
-	FieldTimeout      = "timeout"
-	FieldDeadline     = "deadline"
-	FieldPendingSince = "pending_since"
+	FieldMsg          = "msg"           // Protobuf-encoded task message (asynq format)
+	FieldState        = "state"         // Task state
+	FieldResult       = "result"        // Task result
+	FieldPendingSince = "pending_since" // Timestamp when task entered pending state
+	FieldCompletedAt  = "completed_at"  // Timestamp when task completed
+	FieldRetried      = "retried"       // Number of times task has been retried
+	FieldErrorMsg     = "error_msg"     // Error message for failed tasks
+	FieldLastFailedAt = "last_failed_at"
+	// Legacy field names (for non-asynq format)
+	FieldType     = "type"
+	FieldPayload  = "payload"
+	FieldRetry    = "retry"
+	FieldMaxRetry = "max_retry"
+	FieldQueue    = "queue"
+	FieldTimeout  = "timeout"
+	FieldDeadline = "deadline"
 )
 
-// Task states
+// Task states (asynq-compatible)
 const (
 	StateActive    = "active"
 	StatePending   = "pending"
-	StateCompleted = "completed"
+	StateScheduled = "scheduled"
 	StateRetry     = "retry"
-	StateFailed    = "archived" // asynq uses "archived" for failed
+	StateCompleted = "completed"
+	StateArchived  = "archived" // asynq uses "archived" for failed tasks
 )
 
 // TaskData represents the task data from Redis.
 type TaskData struct {
-	ID        string
-	Type      string
-	Payload   []byte
-	Retry     int
-	MaxRetry  int
-	Queue     string
-	ResultKey string
+	ID       string
+	Type     string
+	Payload  []byte
+	Retry    int    // Current retry count
+	MaxRetry int    // Maximum retry attempts
+	Queue    string
+	TaskKey  string // The task hash key: asynq:{queue}:t:{taskID}
 }
+
+// TypedResponse is the canonical structure used to store task results.
+type TypedResponse map[string]any
 
 // Client wraps Redis operations.
 type Client struct {
@@ -70,10 +86,103 @@ type Client struct {
 
 // NewClient creates a new Redis client wrapper.
 func NewClient(rdb *redis.Client, logger Logger) *Client {
-	return &Client{Rdb: rdb, Logger: logger}
+	return &Client{
+		Rdb:    rdb,
+		Logger: logger,
+	}
 }
 
-// Dequeue attempts to dequeue a task from the given queues.
+// asynqTaskMessage represents the decoded protobuf message from asynq.
+type asynqTaskMessage struct {
+	Type     string
+	Payload  []byte
+	ID       string
+	Queue    string
+	MaxRetry int
+	Retried  int // Current retry count from protobuf field 6
+}
+
+// parseAsynqMessage parses the protobuf-encoded msg field from asynq.
+// Asynq uses protobuf with the following fields:
+// - Field 1 (string): type
+// - Field 2 (bytes): payload
+// - Field 3 (string): id
+// - Field 4 (string): queue
+// - Field 5 (int32): retry (max_retry)
+// - Field 6 (int32): retried (current retry count)
+func parseAsynqMessage(data []byte) (*asynqTaskMessage, error) {
+	msg := &asynqTaskMessage{}
+	pos := 0
+
+	for pos < len(data) {
+		if pos >= len(data) {
+			break
+		}
+
+		// Read field tag (varint)
+		tag := int(data[pos])
+		pos++
+
+		fieldNum := tag >> 3
+		wireType := tag & 0x07
+
+		switch wireType {
+		case 0: // Varint
+			val, n := readVarint(data[pos:])
+			pos += n
+			switch fieldNum {
+			case 5:
+				msg.MaxRetry = int(val)
+			case 6:
+				msg.Retried = int(val)
+			}
+		case 2: // Length-delimited (string, bytes)
+			length, n := readVarint(data[pos:])
+			pos += n
+			if pos+int(length) > len(data) {
+				return nil, fmt.Errorf("invalid protobuf: length exceeds data")
+			}
+			value := data[pos : pos+int(length)]
+			pos += int(length)
+
+			switch fieldNum {
+			case 1:
+				msg.Type = string(value)
+			case 2:
+				msg.Payload = value
+			case 3:
+				msg.ID = string(value)
+			case 4:
+				msg.Queue = string(value)
+			}
+		default:
+			// Skip unknown wire types
+			return nil, fmt.Errorf("unsupported wire type: %d", wireType)
+		}
+	}
+
+	return msg, nil
+}
+
+// readVarint reads a varint from the byte slice and returns the value and bytes consumed.
+func readVarint(data []byte) (uint64, int) {
+	var val uint64
+	var shift uint
+	for i, b := range data {
+		val |= uint64(b&0x7F) << shift
+		if b < 0x80 {
+			return val, i + 1
+		}
+		shift += 7
+		if shift >= 64 {
+			return 0, i + 1
+		}
+	}
+	return val, len(data)
+}
+
+// Dequeue attempts to dequeue a task from the given queues using BRPOP.
+// This is compatible with asynq's list-based pending queue.
 // Returns nil if no task is available.
 func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error) {
 	// Build list of pending queue keys
@@ -84,7 +193,7 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 
 	// BRPOP with timeout - blocks until a task is available
 	result, err := r.Rdb.BRPop(ctx, 2*time.Second, keys...).Result()
-	if err == redis.Nil {
+	if errors.Is(err, redis.Nil) {
 		return nil, nil // No task available
 	}
 	if err != nil {
@@ -95,92 +204,131 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 	queueKey := result[0]
 	taskID := result[1]
 
-	// Extract queue name from key (e.g., "asynq:inference:pending" -> "inference")
+	// Extract queue name from key (e.g., "asynq:{inference}:pending" -> "inference")
 	queueName := strings.TrimPrefix(queueKey, KeyPrefix)
 	queueName = strings.TrimSuffix(queueName, ":pending")
+	queueName = strings.Trim(queueName, "{}")
 
 	// Get task data from hash
-	taskKey := fmt.Sprintf(KeyTask, taskID)
+	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
 	data, err := r.Rdb.HGetAll(ctx, taskKey).Result()
 	if err != nil {
 		return nil, fmt.Errorf("hgetall failed for task %s: %w", taskID, err)
 	}
 
 	if len(data) == 0 {
-		r.Logger.Warn("Task data not found for ID:", taskID)
+		r.Logger.Warn("Task data not found for ID: %s", taskID)
 		return nil, nil
 	}
 
-	// Parse task data
-	var retry, maxRetry int
-	fmt.Sscanf(data[FieldRetry], "%d", &retry)
-	fmt.Sscanf(data[FieldMaxRetry], "%d", &maxRetry)
+	// Parse task data - try asynq protobuf format first, then legacy format
+	var taskType string
+	var payload []byte
+	var maxRetry int
+	var retried int
 
-	// Move task to active queue
+	if msgData, ok := data[FieldMsg]; ok {
+		// Asynq format: parse protobuf-encoded msg field
+		asynqMsg, err := parseAsynqMessage([]byte(msgData))
+		if err != nil {
+			r.Logger.Warn("Failed to parse asynq message for task %s: %v", taskID, err)
+			return nil, nil
+		}
+		taskType = asynqMsg.Type
+		payload = asynqMsg.Payload
+		maxRetry = asynqMsg.MaxRetry
+		retried = asynqMsg.Retried
+	} else {
+		// Legacy format: read individual fields
+		taskType = data[FieldType]
+		fmt.Sscanf(data[FieldMaxRetry], "%d", &maxRetry)
+		fmt.Sscanf(data[FieldRetried], "%d", &retried)
+		if p, ok := data[FieldPayload]; ok {
+			if err := json.Unmarshal([]byte(p), &payload); err != nil {
+				payload = []byte(p)
+			}
+		}
+	}
+
+	// Move task to active queue (ZSET with lease expiration as score, in Unix seconds)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
-	r.Rdb.LPush(ctx, activeKey, taskID)
+	leaseExpiration := float64(time.Now().Add(30 * time.Minute).Unix())
+	r.Rdb.ZAdd(ctx, activeKey, redis.Z{Score: leaseExpiration, Member: taskID})
 
 	// Update task state to active
 	r.Rdb.HSet(ctx, taskKey, FieldState, StateActive)
 
-	// Decode payload (stored as JSON-encoded bytes in asynq)
-	var payload []byte
-	if p, ok := data[FieldPayload]; ok {
-		// Try to unmarshal as JSON string first (asynq stores base64 or raw)
-		if err := json.Unmarshal([]byte(p), &payload); err != nil {
-			payload = []byte(p) // Use raw value
-		}
-	}
-
 	taskData := &TaskData{
-		ID:        taskID,
-		Type:      data[FieldType],
-		Payload:   payload,
-		Retry:     retry,
-		MaxRetry:  maxRetry,
-		Queue:     queueName,
-		ResultKey: fmt.Sprintf(KeyResult, taskID),
+		ID:       taskID,
+		Type:     taskType,
+		Payload:  payload,
+		Retry:    retried,
+		MaxRetry: maxRetry,
+		Queue:    queueName,
+		TaskKey:  taskKey,
 	}
 
 	return taskData, nil
 }
 
 // Complete marks a task as completed and removes it from active queue.
+// Results are already written to the task hash by TaskResultWriter.
 func (r *Client) Complete(ctx context.Context, taskID string, queueName string) error {
-	taskKey := fmt.Sprintf(KeyTask, taskID)
+	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
+	completedKey := fmt.Sprintf(KeyCompleted, queueName)
+
+	now := time.Now().Unix()
 
 	// Remove from active queue
-	r.Rdb.LRem(ctx, activeKey, 1, taskID)
+	r.Rdb.ZRem(ctx, activeKey, taskID)
 
-	// Update state to completed
-	r.Rdb.HSet(ctx, taskKey, FieldState, StateCompleted)
+	// Update task hash: state and completed_at
+	r.Rdb.HSet(ctx, taskKey,
+		FieldState, StateCompleted,
+		FieldCompletedAt, now,
+	)
+
+	// Add to completed sorted set with Unix timestamp as score
+	r.Rdb.ZAdd(ctx, completedKey, redis.Z{Score: float64(now), Member: taskID})
 
 	return nil
 }
 
-// Retry re-queues a task for retry.
+// Retry re-queues a task for retry using the retry sorted set.
 func (r *Client) Retry(ctx context.Context, taskID string, queueName string, delay time.Duration) error {
-	taskKey := fmt.Sprintf(KeyTask, taskID)
+	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
+	retryKey := fmt.Sprintf(KeyRetry, queueName)
 	pendingKey := fmt.Sprintf(KeyPending, queueName)
 
+	now := time.Now()
+
 	// Remove from active queue
-	r.Rdb.LRem(ctx, activeKey, 1, taskID)
+	r.Rdb.ZRem(ctx, activeKey, taskID)
 
-	// Increment retry count
-	r.Rdb.HIncrBy(ctx, taskKey, FieldRetry, 1)
-	r.Rdb.HSet(ctx, taskKey, FieldState, StateRetry)
+	// Increment retry count and update state
+	r.Rdb.HIncrBy(ctx, taskKey, FieldRetried, 1)
+	r.Rdb.HSet(ctx, taskKey,
+		FieldState, StateRetry,
+		FieldLastFailedAt, now.Unix(),
+	)
 
-	// Re-queue after delay (simple approach: sleep then push)
-	// For production, you'd want a scheduled queue
 	if delay > 0 {
+		// Add to retry sorted set with scheduled time as score
+		retryAt := float64(now.Add(delay).Unix())
+		r.Rdb.ZAdd(ctx, retryKey, redis.Z{Score: retryAt, Member: taskID})
+
+		// Start a goroutine to move the task from retry to pending when ready
 		go func() {
 			time.Sleep(delay)
+			// Move from retry to pending
+			r.Rdb.ZRem(context.Background(), retryKey, taskID)
 			r.Rdb.LPush(context.Background(), pendingKey, taskID)
 			r.Rdb.HSet(context.Background(), taskKey, FieldState, StatePending)
 		}()
 	} else {
+		// No delay, push directly to pending
 		r.Rdb.LPush(ctx, pendingKey, taskID)
 		r.Rdb.HSet(ctx, taskKey, FieldState, StatePending)
 	}
@@ -188,17 +336,26 @@ func (r *Client) Retry(ctx context.Context, taskID string, queueName string, del
 	return nil
 }
 
-// Fail marks a task as permanently failed.
+// Fail marks a task as permanently failed (archived).
 func (r *Client) Fail(ctx context.Context, taskID string, queueName string, errMsg string) error {
-	taskKey := fmt.Sprintf(KeyTask, taskID)
+	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
+	archivedKey := fmt.Sprintf(KeyArchived, queueName)
+
+	now := time.Now().Unix()
 
 	// Remove from active queue
-	r.Rdb.LRem(ctx, activeKey, 1, taskID)
+	r.Rdb.ZRem(ctx, activeKey, taskID)
 
-	// Update state to failed (archived in asynq terms)
-	r.Rdb.HSet(ctx, taskKey, FieldState, StateFailed)
-	r.Rdb.HSet(ctx, taskKey, "error", errMsg)
+	// Update task hash: state, error message, and last failed timestamp
+	r.Rdb.HSet(ctx, taskKey,
+		FieldState, StateArchived,
+		FieldErrorMsg, errMsg,
+		FieldLastFailedAt, now,
+	)
+
+	// Add to archived sorted set with Unix timestamp as score
+	r.Rdb.ZAdd(ctx, archivedKey, redis.Z{Score: float64(now), Member: taskID})
 
 	return nil
 }
@@ -206,11 +363,6 @@ func (r *Client) Fail(ctx context.Context, taskID string, queueName string, errM
 // Ping checks Redis connectivity.
 func (r *Client) Ping(ctx context.Context) error {
 	return r.Rdb.Ping(ctx).Err()
-}
-
-// WriteResult writes a task result to Redis.
-func (r *Client) WriteResult(ctx context.Context, resultKey string, data []byte) error {
-	return r.Rdb.Set(ctx, resultKey, data, 0).Err()
 }
 
 // GetRedisClient returns the underlying redis client for advanced operations.

@@ -15,7 +15,6 @@ const (
 	keyPending    = redis.KeyPending
 	keyActive     = redis.KeyActive
 	keyTask       = redis.KeyTask
-	keyResult     = redis.KeyResult
 	keyWorkers    = redis.KeyWorkers
 	keyWorkerData = redis.KeyWorkerData
 )
@@ -48,14 +47,14 @@ func (r *redisClient) dequeue(ctx context.Context, queues []string) (*Task, erro
 
 	// Convert TaskData to Task
 	task := &Task{
-		id:        taskData.ID,
-		typename:  taskData.Type,
-		payload:   taskData.Payload,
-		retry:     taskData.Retry,
-		maxRetry:  taskData.MaxRetry,
-		queue:     taskData.Queue,
-		rdb:       r.rdb,
-		resultKey: taskData.ResultKey,
+		id:       taskData.ID,
+		typename: taskData.Type,
+		payload:  taskData.Payload,
+		retry:    taskData.Retry,
+		maxRetry: taskData.MaxRetry,
+		queue:    taskData.Queue,
+		rdb:      r.rdb,
+		taskKey:  taskData.TaskKey,
 	}
 
 	return task, nil

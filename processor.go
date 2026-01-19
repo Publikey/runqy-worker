@@ -14,10 +14,12 @@ type processor struct {
 	handler       Handler                // fallback handler (ServeMux for type-based routing)
 	queueHandlers map[string]HandlerFunc // queue name -> handler (for queue-based routing)
 	config        Config
-	queues        []string                   // Queue names in priority order
-	queueStates   map[string]*QueueState     // supervised processes per queue (may be nil)
+	queues        []string               // Queue names in priority order
+	queueStates   map[string]*QueueState // supervised processes per queue (may be nil)
 
 	done   chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	logger Logger
 }
@@ -70,6 +72,7 @@ func parentQueueName(subQueueName string) string {
 
 // start begins processing tasks with the configured concurrency.
 func (p *processor) start() {
+	p.ctx, p.cancel = context.WithCancel(context.Background())
 	for i := 0; i < p.config.Concurrency; i++ {
 		p.wg.Add(1)
 		go p.worker(i)
@@ -78,7 +81,7 @@ func (p *processor) start() {
 
 // stop gracefully stops all workers.
 func (p *processor) stop() {
-	close(p.done)
+	p.cancel()
 	p.wg.Wait()
 }
 
@@ -87,22 +90,18 @@ func (p *processor) worker(id int) {
 	defer p.wg.Done()
 
 	p.logger.Info(fmt.Sprintf("Worker %d started", id))
-
 	for {
-		select {
-		case <-p.done:
+		p.processOne(p.ctx)
+		if p.ctx.Err() != nil {
 			p.logger.Info(fmt.Sprintf("Worker %d stopping", id))
 			return
-		default:
-			p.processOne()
 		}
 	}
 }
 
 // processOne attempts to dequeue and process a single task.
-func (p *processor) processOne() {
-	ctx := context.Background()
-
+func (p *processor) processOne(ctx context.Context) {
+	// ctx := context.Background()
 	// Dequeue a task
 	task, err := p.redis.dequeue(ctx, p.queues)
 	if err != nil {

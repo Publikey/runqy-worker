@@ -17,8 +17,8 @@ type Task struct {
 	queue    string // The queue this task was dequeued from
 
 	// For result writing
-	rdb       *redis.Client
-	resultKey string
+	rdb     *redis.Client
+	taskKey string // The task hash key: asynq:{queue}:t:{taskID}
 }
 
 // ID returns the task ID.
@@ -70,6 +70,7 @@ func (w *TaskResultWriter) TaskID() string {
 }
 
 // Write writes data to the task result in Redis.
+// Results are stored in the task hash under the "result" field.
 func (w *TaskResultWriter) Write(data []byte) (int, error) {
 	if w.task.rdb == nil {
 		return len(data), nil // No-op if no Redis client
@@ -78,7 +79,8 @@ func (w *TaskResultWriter) Write(data []byte) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	err := w.task.rdb.Set(ctx, w.task.resultKey, data, 0).Err()
+	// Write result to task hash field "result"
+	err := w.task.rdb.HSet(ctx, w.task.taskKey, "result", data).Err()
 	if err != nil {
 		return 0, err
 	}
