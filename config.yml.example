@@ -11,9 +11,6 @@ bootstrap:
   retries: 3
   retry_delay: "5s"
 
-git:
-  token: "${GITHUB_PAT}"
-  
 deployment:
   dir: "./deployment"
 
