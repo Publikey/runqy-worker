@@ -153,8 +153,25 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 
 // gitCloneSparse performs a sparse checkout to only download the specified subdirectory.
 func gitCloneSparse(ctx context.Context, deployDir, parentDir string, spec DeploymentConfig, gitURL string, env []string, logger Logger) (string, error) {
+
+	repoURL := gitURL
+
+	if parentDir == "" {
+		parentDir = "."
+	}
+	if strings.HasPrefix(parentDir, "http://") || strings.HasPrefix(parentDir, "https://") {
+		return "", fmt.Errorf("invalid parentDir (looks like URL): %s", parentDir)
+	}
+	if err := os.MkdirAll(parentDir, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create parentDir %s: %w", parentDir, err)
+	}
+
+	if !filepath.IsAbs(deployDir) {
+		deployDir = filepath.Join(parentDir, deployDir)
+	}
+
 	logger.Info("Sparse checkout: cloning %s (branch: %s, path: %s) to %s",
-		spec.GitURL, spec.Branch, spec.CodePath, deployDir)
+		repoURL, spec.Branch, spec.CodePath, deployDir)
 
 	// Step 1: Clone with filter (no blobs) and sparse mode
 	args := []string{
@@ -163,7 +180,7 @@ func gitCloneSparse(ctx context.Context, deployDir, parentDir string, spec Deplo
 		"--sparse",
 		"--branch", spec.Branch,
 		"--depth", "1",
-		gitURL,
+		repoURL,
 		deployDir,
 	}
 
@@ -177,17 +194,21 @@ func gitCloneSparse(ctx context.Context, deployDir, parentDir string, spec Deplo
 		return "", fmt.Errorf("git sparse clone failed: %w\nOutput: %s", err, string(output))
 	}
 
-	// Step 2: Set sparse-checkout to only include the specified path
-	sparseArgs := []string{"sparse-checkout", "set", spec.CodePath}
+	// Step 2: Some git versions need init before set
+	initCmd := exec.CommandContext(ctx, "git", "sparse-checkout", "init", "--cone")
+	initCmd.Env = env
+	initCmd.Dir = deployDir
+	_, _ = initCmd.CombinedOutput() // ignore error; newer git doesn't always need it
 
-	sparseCmd := exec.CommandContext(ctx, "git", sparseArgs...)
-	sparseCmd.Env = env
-	sparseCmd.Dir = deployDir
+	// Step 3: Set sparse path
+	setCmd := exec.CommandContext(ctx, "git", "sparse-checkout", "set", spec.CodePath)
+	setCmd.Env = env
+	setCmd.Dir = deployDir
 
-	sparseOutput, err := sparseCmd.CombinedOutput()
+	setOut, err := setCmd.CombinedOutput()
 	if err != nil {
 		os.RemoveAll(deployDir)
-		return "", fmt.Errorf("git sparse-checkout set failed: %w\nOutput: %s", err, string(sparseOutput))
+		return "", fmt.Errorf("git sparse-checkout set failed: %w\nOutput: %s", err, string(setOut))
 	}
 
 	logger.Info("Sparse checkout successful (only downloaded: %s)", spec.CodePath)
