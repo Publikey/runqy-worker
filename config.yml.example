@@ -7,8 +7,8 @@ server:
 
 worker:
   queues:                           # List of queues to listen on
-    - "quickstart-oneshot:default"
-    - "quickstart-oneshot:defaul"
+    - "quickstart-oneshot_default"
+    - "quickstart-oneshot_default"
   concurrency: 1                    # Max parallel tasks (default: 1)
   shutdown_timeout: 30s             # Graceful shutdown wait (default: 8s)
 
