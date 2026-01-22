@@ -181,6 +181,63 @@ func readVarint(data []byte) (uint64, int) {
 	return val, len(data)
 }
 
+// encodeAsynqMessage encodes an asynqTaskMessage back to protobuf format.
+func encodeAsynqMessage(msg *asynqTaskMessage) []byte {
+	var buf []byte
+
+	// Field 1 (string): type
+	if msg.Type != "" {
+		buf = append(buf, (1<<3)|2) // field 1, wire type 2 (length-delimited)
+		buf = appendVarint(buf, uint64(len(msg.Type)))
+		buf = append(buf, msg.Type...)
+	}
+
+	// Field 2 (bytes): payload
+	if len(msg.Payload) > 0 {
+		buf = append(buf, (2<<3)|2) // field 2, wire type 2
+		buf = appendVarint(buf, uint64(len(msg.Payload)))
+		buf = append(buf, msg.Payload...)
+	}
+
+	// Field 3 (string): id
+	if msg.ID != "" {
+		buf = append(buf, (3<<3)|2) // field 3, wire type 2
+		buf = appendVarint(buf, uint64(len(msg.ID)))
+		buf = append(buf, msg.ID...)
+	}
+
+	// Field 4 (string): queue
+	if msg.Queue != "" {
+		buf = append(buf, (4<<3)|2) // field 4, wire type 2
+		buf = appendVarint(buf, uint64(len(msg.Queue)))
+		buf = append(buf, msg.Queue...)
+	}
+
+	// Field 5 (int32): retry (max_retry)
+	if msg.MaxRetry > 0 {
+		buf = append(buf, (5<<3)|0) // field 5, wire type 0 (varint)
+		buf = appendVarint(buf, uint64(msg.MaxRetry))
+	}
+
+	// Field 6 (int32): retried (current retry count)
+	if msg.Retried > 0 {
+		buf = append(buf, (6<<3)|0) // field 6, wire type 0 (varint)
+		buf = appendVarint(buf, uint64(msg.Retried))
+	}
+
+	return buf
+}
+
+// appendVarint appends a varint-encoded uint64 to the buffer.
+func appendVarint(buf []byte, val uint64) []byte {
+	for val >= 0x80 {
+		buf = append(buf, byte(val)|0x80)
+		val >>= 7
+	}
+	buf = append(buf, byte(val))
+	return buf
+}
+
 // Dequeue attempts to dequeue a task from the given queues using BRPOP.
 // This is compatible with asynq's list-based pending queue.
 // Returns nil if no task is available.
@@ -238,6 +295,14 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 		payload = asynqMsg.Payload
 		maxRetry = asynqMsg.MaxRetry
 		retried = asynqMsg.Retried
+		// Check the hash field for updated retry count (incremented by Retry())
+		// since the protobuf message is not updated on retries
+		if retriedStr, ok := data[FieldRetried]; ok {
+			var hashRetried int
+			if _, err := fmt.Sscanf(retriedStr, "%d", &hashRetried); err == nil && hashRetried > retried {
+				retried = hashRetried
+			}
+		}
 	} else {
 		// Legacy format: read individual fields
 		taskType = data[FieldType]
@@ -307,7 +372,16 @@ func (r *Client) Retry(ctx context.Context, taskID string, queueName string, del
 	// Remove from active queue
 	r.Rdb.ZRem(ctx, activeKey, taskID)
 
-	// Increment retry count and update state
+	// Update the protobuf msg field with incremented retry count (for asynqmon compatibility)
+	if msgData, err := r.Rdb.HGet(ctx, taskKey, FieldMsg).Result(); err == nil {
+		if asynqMsg, err := parseAsynqMessage([]byte(msgData)); err == nil {
+			asynqMsg.Retried++
+			updatedMsg := encodeAsynqMessage(asynqMsg)
+			r.Rdb.HSet(ctx, taskKey, FieldMsg, string(updatedMsg))
+		}
+	}
+
+	// Increment retry count in hash field and update state
 	r.Rdb.HIncrBy(ctx, taskKey, FieldRetried, 1)
 	r.Rdb.HSet(ctx, taskKey,
 		FieldState, StateRetry,
