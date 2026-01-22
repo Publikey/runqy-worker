@@ -1,0 +1,14 @@
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+  <!-- Distribution lines - slate -->
+  <line x1="32" y1="50" x2="72" y2="22" stroke="#64748B" stroke-width="3" stroke-linecap="round" />
+  <line x1="32" y1="50" x2="78" y2="50" stroke="#64748B" stroke-width="3" stroke-linecap="round" />
+  <line x1="32" y1="50" x2="72" y2="78" stroke="#64748B" stroke-width="3" stroke-linecap="round" />
+
+  <!-- Central node (task source) - blue -->
+  <circle cx="32" cy="50" r="14" fill="#3B82F6" />
+
+  <!-- Worker nodes - white -->
+  <circle cx="72" cy="22" r="9" fill="#E2E8F0" />
+  <circle cx="78" cy="50" r="9" fill="#E2E8F0" />
+  <circle cx="72" cy="78" r="9" fill="#E2E8F0" />
+</svg>

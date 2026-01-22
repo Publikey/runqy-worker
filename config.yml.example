@@ -1,18 +1,27 @@
+# runqy-worker configuration
+# Env vars: ${VAR} or ${VAR:-default}
+
 server:
-  url: "http://localhost:8081"
-  api_key: "dev-api-key-12345"
+  url: "http://localhost:3000"      # Required: runqy-server URL
+  api_key: "dev-api-key"            # Required: must match server's RUNQY_API_KEY
 
 worker:
-  queue: "inference"
-  concurrency: 1
-  shutdown_timeout: 30s
+  queues:                           # List of queues to listen on
+    - "quickstart-oneshot:default"
+    - "quickstart-oneshot:defaul"
+  concurrency: 1                    # Max parallel tasks (default: 1)
+  shutdown_timeout: 30s             # Graceful shutdown wait (default: 8s)
 
 bootstrap:
-  retries: 3
-  retry_delay: "5s"
+  retries: 3                        # Server contact retries (default: 3)
+  retry_delay: "5s"                 # Delay between retries (default: 5s)
+
+git:
+  # ssh_key: "/path/to/id_rsa"      # SSH key for private repos
+  # token: "${GITHUB_TOKEN}"        # PAT for HTTPS auth
 
 deployment:
-  dir: "./deployment"
+  dir: "./deployment"               # Code clone & venv dir (reused on restart)
 
 retry:
-  max_retry: 2
+  max_retry: 2                      # Max retry attempts (default: 25)

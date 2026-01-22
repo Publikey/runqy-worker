@@ -1,6 +1,16 @@
-# runqy-worker
+<p align="center">
+  <img src="assets/logo.svg" alt="runqy logo" width="80" height="80">
+</p>
 
-A Go worker binary for distributed task processing with server-driven bootstrap architecture. Part of the [runqy](https://github.com/publikey/runqy) distributed task queue system.
+<h1 align="center">runqy-worker</h1>
+
+<p align="center">
+  A Go worker binary for distributed task processing with server-driven bootstrap architecture.
+  <br>
+  Part of the <a href="https://github.com/publikey/runqy">runqy</a> distributed task queue system.
+  <br>
+  <a href="https://docs.runqy.com"><strong>Documentation</strong></a> · <a href="https://runqy.com"><strong>Website</strong></a>
+</p>
 
 ## Overview
 
@@ -377,8 +387,9 @@ go test ./...
 
 ## Related Projects
 
-- [runqy-server-minimal](https://github.com/publikey/runqy-server-minimal) - Central configuration server
+- [runqy](https://github.com/publikey/runqy) - Central configuration server with CLI and monitoring
 - [runqy-python](https://github.com/publikey/runqy-python) - Python SDK (`runqy-task`)
+- [Documentation](https://docs.runqy.com) - Full documentation at docs.runqy.com
 
 ## Contributing
 
