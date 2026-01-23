@@ -320,8 +320,9 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 	leaseExpiration := float64(time.Now().Add(30 * time.Minute).Unix())
 	r.Rdb.ZAdd(ctx, activeKey, redis.Z{Score: leaseExpiration, Member: taskID})
 
-	// Update task state to active
+	// Update task state to active and remove pending_since (asynq-compatible)
 	r.Rdb.HSet(ctx, taskKey, FieldState, StateActive)
+	r.Rdb.HDel(ctx, taskKey, FieldPendingSince)
 
 	taskData := &TaskData{
 		ID:       taskID,
