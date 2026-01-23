@@ -36,7 +36,92 @@ runqy-worker is a stateless task executor that:
 - **asynq-compatible** - Uses the same Redis key format as [hibiken/asynq](https://github.com/hibiken/asynq)
 - **Graceful shutdown** - Proper cleanup on SIGTERM/SIGINT
 
-## Installation
+## Quickstart
+
+### Binary Download
+
+Download pre-built binaries from the [GitHub releases page](https://github.com/publikey/runqy-worker/releases).
+
+**Linux (amd64):**
+```bash
+curl -LO https://github.com/publikey/runqy-worker/releases/latest/download/runqy-worker_latest_linux_amd64.tar.gz
+tar -xzf runqy-worker_latest_linux_amd64.tar.gz
+./runqy-worker -config config.yml
+```
+
+**macOS (Apple Silicon):**
+```bash
+curl -LO https://github.com/publikey/runqy-worker/releases/latest/download/runqy-worker_latest_darwin_arm64.tar.gz
+tar -xzf runqy-worker_latest_darwin_arm64.tar.gz
+./runqy-worker -config config.yml
+```
+
+**Windows (amd64):**
+```powershell
+Invoke-WebRequest -Uri https://github.com/publikey/runqy-worker/releases/latest/download/runqy-worker_latest_windows_amd64.zip -OutFile runqy-worker.zip
+Expand-Archive runqy-worker.zip -DestinationPath .
+.\runqy-worker.exe -config config.yml
+```
+
+Available archives:
+- `runqy-worker_<version>_linux_amd64.tar.gz`
+- `runqy-worker_<version>_linux_arm64.tar.gz`
+- `runqy-worker_<version>_darwin_amd64.tar.gz`
+- `runqy-worker_<version>_darwin_arm64.tar.gz`
+- `runqy-worker_<version>_windows_amd64.zip`
+- `runqy-worker_<version>_windows_arm64.zip`
+
+### Docker
+
+Docker images are available at `ghcr.io/publikey/runqy-worker`.
+
+#### Minimal Image (default)
+
+Lightweight Alpine-based image with git, curl, and ca-certificates. You install your own runtime (Python, Node, etc.).
+
+- **Image:** `ghcr.io/publikey/runqy-worker:latest` or `:minimal`
+- **Base:** Alpine 3.19
+- **Platforms:** linux/amd64, linux/arm64
+
+```bash
+docker run -v $(pwd)/config.yml:/app/config.yml ghcr.io/publikey/runqy-worker:latest
+```
+
+#### Inference Image
+
+Pre-configured for ML workloads with PyTorch and CUDA.
+
+- **Image:** `ghcr.io/publikey/runqy-worker:inference`
+- **Base:** PyTorch 2.1.0 + CUDA 11.8
+- **Platform:** linux/amd64 only
+- **Includes:** Python 3, pip, PyTorch, CUDA runtime
+
+```bash
+docker run --gpus all -v $(pwd)/config.yml:/app/config.yml ghcr.io/publikey/runqy-worker:inference
+```
+
+#### Docker Compose
+
+```yaml
+version: "3.8"
+services:
+  worker:
+    image: ghcr.io/publikey/runqy-worker:latest
+    volumes:
+      - ./config.yml:/app/config.yml
+      - ./deployment:/app/deployment
+    restart: unless-stopped
+```
+
+#### Available Tags
+
+| Tag | Description |
+|-----|-------------|
+| `latest`, `minimal` | Minimal Alpine image (multi-arch) |
+| `inference` | PyTorch + CUDA image (amd64 only) |
+| `<version>` | Specific version, minimal base |
+| `<version>-minimal` | Specific version, minimal base |
+| `<version>-inference` | Specific version, inference base |
 
 ### From Source
 
@@ -46,13 +131,13 @@ cd runqy-worker
 go build ./cmd/worker
 ```
 
-### Build with Version Info
+#### Build with Version Info
 
 ```bash
 go build -ldflags "-X main.Version=1.0.0 -X main.Commit=$(git rev-parse HEAD) -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" ./cmd/worker
 ```
 
-## Quick Start
+## Configuration
 
 1. **Create configuration file** (`config.yml`):
 
@@ -83,19 +168,19 @@ retry:
 2. **Run the worker**:
 
 ```bash
-./worker -config config.yml
+./runqy-worker -config config.yml
 ```
 
 3. **Verify configuration** (without starting):
 
 ```bash
-./worker -config config.yml -validate
+./runqy-worker -config config.yml -validate
 ```
 
 4. **Check version**:
 
 ```bash
-./worker -version
+./runqy-worker -version
 ```
 
 ## Configuration Reference
@@ -377,7 +462,7 @@ go test ./...
 ### Run with Verbose Logging
 
 ```bash
-./worker -config config.yml 2>&1 | tee worker.log
+./runqy-worker -config config.yml 2>&1 | tee worker.log
 ```
 
 ## Dependencies

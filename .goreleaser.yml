@@ -96,3 +96,19 @@ release:
   draft: false
   prerelease: auto
   name_template: "{{.Tag}}"
+  footer: |
+    ## Docker Images
+
+    **Minimal** (Python 3, ~50MB):
+    ```bash
+    docker pull ghcr.io/publikey/runqy-worker:{{ .Tag }}
+    # or
+    docker pull ghcr.io/publikey/runqy-worker:{{ .Tag }}-minimal
+    ```
+
+    **Inference** (PyTorch + CUDA, amd64 only):
+    ```bash
+    docker pull ghcr.io/publikey/runqy-worker:{{ .Tag }}-inference
+    ```
+
+    Browse all tags: https://ghcr.io/publikey/runqy-worker
