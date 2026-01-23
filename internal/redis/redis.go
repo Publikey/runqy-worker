@@ -24,7 +24,8 @@ type Logger interface {
 const (
 	KeyPrefix     = "asynq:"
 	KeyPending    = KeyPrefix + "{%s}:pending"   // List of pending task IDs
-	KeyActive     = KeyPrefix + "{%s}:active"    // Sorted set of active task IDs (score = lease expiration)
+	KeyActive     = KeyPrefix + "{%s}:active"    // List of active task IDs
+	KeyLease      = KeyPrefix + "{%s}:lease"     // Sorted set for lease expiration tracking (score = expiration time)
 	KeyScheduled  = KeyPrefix + "{%s}:scheduled" // Sorted set of scheduled task IDs
 	KeyRetry      = KeyPrefix + "{%s}:retry"     // Sorted set of retry task IDs (score = retry time)
 	KeyCompleted  = KeyPrefix + "{%s}:completed" // Sorted set of completed task IDs
@@ -315,10 +316,12 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 		}
 	}
 
-	// Move task to active queue (ZSET with lease expiration as score, in Unix seconds)
+	// Move task to active queue (List) and lease tracking (Sorted Set)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
+	leaseKey := fmt.Sprintf(KeyLease, queueName)
 	leaseExpiration := float64(time.Now().Add(30 * time.Minute).Unix())
-	r.Rdb.ZAdd(ctx, activeKey, redis.Z{Score: leaseExpiration, Member: taskID})
+	r.Rdb.LPush(ctx, activeKey, taskID)
+	r.Rdb.ZAdd(ctx, leaseKey, redis.Z{Score: leaseExpiration, Member: taskID})
 
 	// Update task state to active and remove pending_since (asynq-compatible)
 	r.Rdb.HSet(ctx, taskKey, FieldState, StateActive)
@@ -342,12 +345,14 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 func (r *Client) Complete(ctx context.Context, taskID string, queueName string) error {
 	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
+	leaseKey := fmt.Sprintf(KeyLease, queueName)
 	completedKey := fmt.Sprintf(KeyCompleted, queueName)
 
 	now := time.Now().Unix()
 
-	// Remove from active queue
-	r.Rdb.ZRem(ctx, activeKey, taskID)
+	// Remove from active queue (List) and lease tracking (Sorted Set)
+	r.Rdb.LRem(ctx, activeKey, 1, taskID)
+	r.Rdb.ZRem(ctx, leaseKey, taskID)
 
 	// Update task hash: state and completed_at
 	r.Rdb.HSet(ctx, taskKey,
@@ -365,13 +370,15 @@ func (r *Client) Complete(ctx context.Context, taskID string, queueName string) 
 func (r *Client) Retry(ctx context.Context, taskID string, queueName string, delay time.Duration) error {
 	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
+	leaseKey := fmt.Sprintf(KeyLease, queueName)
 	retryKey := fmt.Sprintf(KeyRetry, queueName)
 	pendingKey := fmt.Sprintf(KeyPending, queueName)
 
 	now := time.Now()
 
-	// Remove from active queue
-	r.Rdb.ZRem(ctx, activeKey, taskID)
+	// Remove from active queue (List) and lease tracking (Sorted Set)
+	r.Rdb.LRem(ctx, activeKey, 1, taskID)
+	r.Rdb.ZRem(ctx, leaseKey, taskID)
 
 	// Update the protobuf msg field with incremented retry count (for asynqmon compatibility)
 	if msgData, err := r.Rdb.HGet(ctx, taskKey, FieldMsg).Result(); err == nil {
@@ -415,12 +422,14 @@ func (r *Client) Retry(ctx context.Context, taskID string, queueName string, del
 func (r *Client) Fail(ctx context.Context, taskID string, queueName string, errMsg string) error {
 	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
+	leaseKey := fmt.Sprintf(KeyLease, queueName)
 	archivedKey := fmt.Sprintf(KeyArchived, queueName)
 
 	now := time.Now().Unix()
 
-	// Remove from active queue
-	r.Rdb.ZRem(ctx, activeKey, taskID)
+	// Remove from active queue (List) and lease tracking (Sorted Set)
+	r.Rdb.LRem(ctx, activeKey, 1, taskID)
+	r.Rdb.ZRem(ctx, leaseKey, taskID)
 
 	// Update task hash: state, error message, and last failed timestamp
 	r.Rdb.HSet(ctx, taskKey,
