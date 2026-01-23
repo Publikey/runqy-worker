@@ -1,0 +1,28 @@
+# Inference-ready image with Python3, pip, virtualenv
+# User installs their own ML libraries via bootstrap
+
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+
+ARG TARGETOS
+ARG TARGETARCH
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository -y ppa:git-core/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    wget \
+    ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy pre-built binary from goreleaser (platform-specific path)
+COPY ${TARGETOS}/${TARGETARCH}/runqy-worker .
+
+CMD ["./runqy-worker"]
