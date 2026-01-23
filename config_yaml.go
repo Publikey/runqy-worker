@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -90,8 +92,9 @@ type RetryConfig struct {
 	MaxRetry int `yaml:"max_retry"`
 }
 
-// LoadConfig loads configuration from a YAML file.
+// LoadConfig loads configuration from a YAML file or environment variables.
 // If path is empty, it defaults to "config.yml" in the current directory.
+// If the config file does not exist, it falls back to environment variables.
 func LoadConfig(path string) (*Config, error) {
 	if path == "" {
 		path = "config.yml"
@@ -99,6 +102,11 @@ func LoadConfig(path string) (*Config, error) {
 
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// Fall back to environment variables
+			cfg := loadConfigFromEnv()
+			return &cfg, nil
+		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
@@ -112,6 +120,80 @@ func LoadConfig(path string) (*Config, error) {
 
 	cfg := toWorkerConfig(&yc)
 	return &cfg, nil
+}
+
+// loadConfigFromEnv builds configuration purely from environment variables.
+// Environment variables:
+//   - RUNQY_SERVER_URL: runqy-server URL (required)
+//   - RUNQY_API_KEY: Authentication key (required)
+//   - RUNQY_QUEUES: Comma-separated list of queue names (required)
+//   - RUNQY_CONCURRENCY: Number of concurrent workers (default: 1)
+//   - RUNQY_SHUTDOWN_TIMEOUT: Graceful shutdown timeout (default: 8s)
+//   - RUNQY_BOOTSTRAP_RETRIES: Number of bootstrap retries (default: 3)
+//   - RUNQY_BOOTSTRAP_RETRY_DELAY: Delay between retries (default: 5s)
+//   - RUNQY_GIT_SSH_KEY: Path to SSH private key
+//   - RUNQY_GIT_TOKEN: Git personal access token
+//   - RUNQY_DEPLOYMENT_DIR: Code deployment directory (default: ./deployment)
+//   - RUNQY_MAX_RETRY: Max task retry attempts (default: 25)
+func loadConfigFromEnv() Config {
+	cfg := DefaultConfig()
+
+	// Server settings (required)
+	cfg.ServerURL = os.Getenv("RUNQY_SERVER_URL")
+	cfg.APIKey = os.Getenv("RUNQY_API_KEY")
+
+	// Queue settings
+	if queues := os.Getenv("RUNQY_QUEUES"); queues != "" {
+		cfg.QueueNames = strings.Split(queues, ",")
+		for i := range cfg.QueueNames {
+			cfg.QueueNames[i] = strings.TrimSpace(cfg.QueueNames[i])
+		}
+		if len(cfg.QueueNames) > 0 {
+			cfg.Queue = cfg.QueueNames[0]
+		}
+	}
+
+	// Worker settings
+	if concurrency := os.Getenv("RUNQY_CONCURRENCY"); concurrency != "" {
+		if n, err := strconv.Atoi(concurrency); err == nil && n > 0 {
+			cfg.Concurrency = n
+		}
+	}
+	if timeout := os.Getenv("RUNQY_SHUTDOWN_TIMEOUT"); timeout != "" {
+		if d, err := time.ParseDuration(timeout); err == nil {
+			cfg.ShutdownTimeout = d
+		}
+	}
+
+	// Bootstrap settings
+	if retries := os.Getenv("RUNQY_BOOTSTRAP_RETRIES"); retries != "" {
+		if n, err := strconv.Atoi(retries); err == nil && n > 0 {
+			cfg.BootstrapRetries = n
+		}
+	}
+	if delay := os.Getenv("RUNQY_BOOTSTRAP_RETRY_DELAY"); delay != "" {
+		if d, err := time.ParseDuration(delay); err == nil {
+			cfg.BootstrapRetryDelay = d
+		}
+	}
+
+	// Git authentication
+	cfg.GitSSHKey = os.Getenv("RUNQY_GIT_SSH_KEY")
+	cfg.GitToken = os.Getenv("RUNQY_GIT_TOKEN")
+
+	// Deployment settings
+	if dir := os.Getenv("RUNQY_DEPLOYMENT_DIR"); dir != "" {
+		cfg.DeploymentDir = dir
+	}
+
+	// Retry settings
+	if maxRetry := os.Getenv("RUNQY_MAX_RETRY"); maxRetry != "" {
+		if n, err := strconv.Atoi(maxRetry); err == nil && n > 0 {
+			cfg.MaxRetry = n
+		}
+	}
+
+	return cfg
 }
 
 // expandEnvVars replaces ${VAR} and ${VAR:-default} patterns with environment variable values.

@@ -1,0 +1,19 @@
+# Minimal image - bare essentials only
+# User installs their own runtime (Python, Node, Rust, Java, etc.)
+
+FROM alpine:3.19
+
+ARG TARGETOS
+ARG TARGETARCH
+
+RUN apk add --no-cache \
+    git \
+    curl \
+    ca-certificates
+
+WORKDIR /app
+
+# Copy pre-built binary from goreleaser (platform-specific path)
+COPY ${TARGETOS}/${TARGETARCH}/runqy-worker .
+
+CMD ["./runqy-worker"]

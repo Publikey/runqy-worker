@@ -30,7 +30,7 @@ archives:
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
-        format: zip
+        formats: ['zip']
     files:
       - LICENSE*
       - README*
@@ -48,6 +48,46 @@ changelog:
       - '^ci:'
       - Merge pull request
       - Merge branch
+
+dockers_v2:
+  # Minimal image - multi-arch
+  - id: minimal
+    ids:
+      - worker
+    images:
+      - "ghcr.io/publikey/runqy-worker"
+    tags:
+      - "{{ .Tag }}"
+      - "{{ .Tag }}-minimal"
+      - "latest"
+      - "minimal"
+    dockerfile: Dockerfile.minimal
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      "org.opencontainers.image.title": "{{ .ProjectName }}"
+      "org.opencontainers.image.version": "{{ .Version }}"
+      "org.opencontainers.image.source": "{{ .GitURL }}"
+      "org.opencontainers.image.revision": "{{ .FullCommit }}"
+
+  # Inference image - amd64 only (CUDA)
+  - id: inference
+    ids:
+      - worker
+    images:
+      - "ghcr.io/publikey/runqy-worker"
+    tags:
+      - "{{ .Tag }}-inference"
+      - "inference"
+    dockerfile: Dockerfile.inference
+    platforms:
+      - linux/amd64
+    labels:
+      "org.opencontainers.image.title": "{{ .ProjectName }}"
+      "org.opencontainers.image.version": "{{ .Version }}"
+      "org.opencontainers.image.source": "{{ .GitURL }}"
+      "org.opencontainers.image.revision": "{{ .FullCommit }}"
 
 release:
   github:
