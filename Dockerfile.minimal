@@ -9,7 +9,9 @@ ARG TARGETARCH
 RUN apk add --no-cache \
     git \
     curl \
-    ca-certificates
+    ca-certificates \
+    python3 \
+    py3-pip
 
 WORKDIR /app
 
