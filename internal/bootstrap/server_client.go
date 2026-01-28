@@ -35,10 +35,11 @@ type Config struct {
 
 // Response contains the configuration received from runqy-server.
 type Response struct {
-	Redis      RedisConfig      `json:"redis"`
-	Queue      QueueConfig      `json:"queue"`
-	SubQueues  []SubQueueConfig `json:"sub_queues"`
-	Deployment DeploymentConfig `json:"deployment"`
+	Redis      RedisConfig       `json:"redis"`
+	Queue      QueueConfig       `json:"queue"`
+	SubQueues  []SubQueueConfig  `json:"sub_queues"`
+	Deployment DeploymentConfig  `json:"deployment"`
+	Vaults     map[string]string `json:"vaults,omitempty"` // Decrypted vault key-value pairs for env injection
 }
 
 // RedisConfig holds Redis connection settings from server.

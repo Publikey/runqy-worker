@@ -18,11 +18,12 @@ import (
 // The process handles one task and exits. Suitable for lightweight tasks
 // that don't benefit from staying loaded in memory.
 type OneShotHandler struct {
-	repoPath   string
-	venvPath   string
-	venvPython string
-	startupCmd string
-	envVars    map[string]string
+	repoPath     string
+	venvPath     string
+	venvPython   string
+	startupCmd   string
+	envVars      map[string]string
+	vaultVars    map[string]string // Vault entries to inject as environment variables
 	timeout      time.Duration
 	redisStorage bool
 	logger       Logger
@@ -34,6 +35,7 @@ func NewOneShotHandler(
 	venvPath string,
 	startupCmd string,
 	envVars map[string]string,
+	vaultVars map[string]string,
 	timeout time.Duration,
 	redisStorage bool,
 	logger Logger,
@@ -56,6 +58,7 @@ func NewOneShotHandler(
 		venvPython:   venvPython,
 		startupCmd:   startupCmd,
 		envVars:      envVars,
+		vaultVars:    vaultVars,
 		timeout:      timeout,
 		redisStorage: redisStorage,
 		logger:       logger,
@@ -305,7 +308,12 @@ func (h *OneShotHandler) buildEnvironment() []string {
 	// Add VIRTUAL_ENV
 	env = append(env, "VIRTUAL_ENV="+h.venvPath)
 
-	// Add custom environment variables
+	// Add vault environment variables first (can be overridden by spec env_vars)
+	for k, v := range h.vaultVars {
+		env = append(env, k+"="+v)
+	}
+
+	// Add custom environment variables (overrides vault vars if same key)
 	for k, v := range h.envVars {
 		env = append(env, k+"="+v)
 	}
