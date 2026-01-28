@@ -226,11 +226,15 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 	case "one_shot":
 		// One-shot mode: spawn new process per task
 		w.logger.Info("[%s] Setting up one-shot handler...", queueName)
+		if len(resp.Vaults) > 0 {
+			w.logger.Info("[%s] Injecting %d vault entries as environment variables", queueName, len(resp.Vaults))
+		}
 		state.OneShotHandler = NewOneShotHandler(
 			deployment.CodePath, // Use CodePath (includes code_path subdirectory)
 			deployment.VenvPath,
 			resp.Deployment.StartupCmd,
 			resp.Deployment.EnvVars,
+			resp.Vaults,
 			resp.Deployment.StartupTimeoutSecs,
 			w.logger,
 		)
@@ -242,7 +246,10 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 	default: // "long_running"
 		// Long-running mode: single supervised process
 		w.logger.Info("[%s] Starting supervised process...", queueName)
-		state.Supervisor = newProcessSupervisor(deployment, resp.Deployment, w.logger)
+		if len(resp.Vaults) > 0 {
+			w.logger.Info("[%s] Injecting %d vault entries as environment variables", queueName, len(resp.Vaults))
+		}
+		state.Supervisor = newProcessSupervisor(deployment, resp.Deployment, resp.Vaults, w.logger)
 		if err := state.Supervisor.Start(ctx); err != nil {
 			return nil, fmt.Errorf("failed to start process: %w", err)
 		}

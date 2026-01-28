@@ -67,6 +67,6 @@ func deployCode(ctx context.Context, config Config, spec BootstrapDeploymentConf
 }
 
 // newProcessSupervisor creates a new ProcessSupervisor.
-func newProcessSupervisor(deployment *DeploymentResult, spec BootstrapDeploymentConfig, logger Logger) *ProcessSupervisor {
-	return internalbootstrap.NewProcessSupervisor(deployment, spec, &loggerAdapter{logger})
+func newProcessSupervisor(deployment *DeploymentResult, spec BootstrapDeploymentConfig, vaultVars map[string]string, logger Logger) *ProcessSupervisor {
+	return internalbootstrap.NewProcessSupervisor(deployment, spec, vaultVars, &loggerAdapter{logger})
 }

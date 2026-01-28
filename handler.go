@@ -131,6 +131,7 @@ func NewOneShotHandler(
 	venvPath string,
 	startupCmd string,
 	envVars map[string]string,
+	vaultVars map[string]string,
 	timeoutSecs int,
 	logger Logger,
 ) *OneShotHandler {
@@ -144,6 +145,7 @@ func NewOneShotHandler(
 			venvPath,
 			startupCmd,
 			envVars,
+			vaultVars,
 			timeout,
 			&loggerAdapter{logger},
 		),
