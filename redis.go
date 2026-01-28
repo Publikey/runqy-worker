@@ -79,3 +79,18 @@ func (r *redisClient) fail(ctx context.Context, task *Task, queueName string, er
 func (r *redisClient) ping(ctx context.Context) error {
 	return r.internal.Ping(ctx)
 }
+
+// cleanupActive removes a task from active queue without storing completion data.
+func (r *redisClient) cleanupActive(ctx context.Context, task *Task, queueName string) error {
+	return r.internal.CleanupActive(ctx, task.id, queueName)
+}
+
+// incrementProcessed increments the processed counters for a queue.
+func (r *redisClient) incrementProcessed(ctx context.Context, queueName string) error {
+	return r.internal.IncrementProcessed(ctx, queueName)
+}
+
+// incrementFailed increments the failed counters for a queue.
+func (r *redisClient) incrementFailed(ctx context.Context, queueName string) error {
+	return r.internal.IncrementFailed(ctx, queueName)
+}

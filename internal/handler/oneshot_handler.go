@@ -18,14 +18,15 @@ import (
 // The process handles one task and exits. Suitable for lightweight tasks
 // that don't benefit from staying loaded in memory.
 type OneShotHandler struct {
-	repoPath   string
-	venvPath   string
-	venvPython string
-	startupCmd string
-	envVars    map[string]string
-	vaultVars  map[string]string // Vault entries to inject as environment variables
-	timeout    time.Duration
-	logger     Logger
+	repoPath     string
+	venvPath     string
+	venvPython   string
+	startupCmd   string
+	envVars      map[string]string
+	vaultVars    map[string]string // Vault entries to inject as environment variables
+	timeout      time.Duration
+	redisStorage bool
+	logger       Logger
 }
 
 // NewOneShotHandler creates a new OneShotHandler.
@@ -36,6 +37,7 @@ func NewOneShotHandler(
 	envVars map[string]string,
 	vaultVars map[string]string,
 	timeout time.Duration,
+	redisStorage bool,
 	logger Logger,
 ) *OneShotHandler {
 	if timeout <= 0 {
@@ -51,14 +53,15 @@ func NewOneShotHandler(
 	}
 
 	return &OneShotHandler{
-		repoPath:   repoPath,
-		venvPath:   venvPath,
-		venvPython: venvPython,
-		startupCmd: startupCmd,
-		envVars:    envVars,
-		vaultVars:  vaultVars,
-		timeout:    timeout,
-		logger:     logger,
+		repoPath:     repoPath,
+		venvPath:     venvPath,
+		venvPython:   venvPython,
+		startupCmd:   startupCmd,
+		envVars:      envVars,
+		vaultVars:    vaultVars,
+		timeout:      timeout,
+		redisStorage: redisStorage,
+		logger:       logger,
 	}
 }
 
@@ -254,8 +257,8 @@ func (h *OneShotHandler) handleResponse(resp *StdioTaskResponse, task Task) erro
 		return NewSkipRetryError(resp.Error)
 	}
 
-	// Success - write result
-	if len(resp.Result) > 0 {
+	// Success - write result only if redis storage is enabled
+	if h.redisStorage && len(resp.Result) > 0 {
 		if _, err := task.ResultWriter().Write(resp.Result); err != nil {
 			h.logger.Error("OneShot: failed to write task result: %v", err)
 		}

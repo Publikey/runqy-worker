@@ -44,7 +44,7 @@ type Response struct {
 
 // RedisConfig holds Redis connection settings from server.
 type RedisConfig struct {
-	Addr     string `json:"addr"`     // "host:port"
+	Addr     string `json:"addr"` // "host:port"
 	Password string `json:"password"`
 	DB       int    `json:"db"`
 	UseTLS   bool   `json:"use_tls"` // Simple boolean for TLS
@@ -68,6 +68,7 @@ type DeploymentConfig struct {
 	Branch             string            `json:"branch"`               // Git branch/tag
 	CodePath           string            `json:"code_path"`            // Subdirectory where task code lives (enables sparse checkout)
 	StartupCmd         string            `json:"startup_cmd"`          // Command to start process
+	RedisStorage       bool              `json:"redis_storage"`        // Write the result on redis or not
 	EnvVars            map[string]string `json:"env_vars"`             // Environment variables
 	StartupTimeoutSecs int               `json:"startup_timeout_secs"` // Timeout for ready signal
 	Mode               string            `json:"mode"`                 // "long_running" (default) or "one_shot"

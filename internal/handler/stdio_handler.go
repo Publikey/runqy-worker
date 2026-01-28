@@ -35,6 +35,8 @@ type StdioHandler struct {
 	mu      sync.RWMutex
 	logger  Logger
 
+	redisStorage bool
+
 	// For graceful shutdown
 	done   chan struct{}
 	wg     sync.WaitGroup
@@ -44,13 +46,14 @@ type StdioHandler struct {
 // NewStdioHandler creates a new StdioHandler.
 // stdin is used to write task requests, stdout is used to read responses.
 // The caller must call Start() to begin reading responses.
-func NewStdioHandler(stdin io.Writer, stdout io.Reader, logger Logger) *StdioHandler {
+func NewStdioHandler(stdin io.Writer, stdout io.Reader, logger Logger, redisStorage bool) *StdioHandler {
 	return &StdioHandler{
 		stdin:   stdin,
 		stdout:  stdout,
-		pending: make(map[string]chan *StdioTaskResponse),
-		logger:  logger,
-		done:    make(chan struct{}),
+		pending:      make(map[string]chan *StdioTaskResponse),
+		logger:       logger,
+		redisStorage: redisStorage,
+		done:         make(chan struct{}),
 	}
 }
 
@@ -170,8 +173,8 @@ func (h *StdioHandler) handleResponse(resp *StdioTaskResponse, task Task) error 
 		return NewSkipRetryError(resp.Error)
 	}
 
-	// Success - write result
-	if len(resp.Result) > 0 {
+	// Success - write result only if redis storage is enabled
+	if h.redisStorage && len(resp.Result) > 0 {
 		if _, err := task.ResultWriter().Write(resp.Result); err != nil {
 			h.logger.Error("Failed to write task result: %v", err)
 		}

@@ -27,6 +27,7 @@ type QueueState struct {
 	StdioHandler   *StdioHandler
 	OneShotHandler *OneShotHandler
 	Mode           string // "long_running" or "one_shot"
+	RedisStorage   bool   // Whether to store results/completion in Redis
 }
 
 // Worker processes tasks from Redis queues.
@@ -208,12 +209,13 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 	}
 
 	state := &QueueState{
-		Name:       queueName,
-		Priority:   resp.Queue.Priority,
-		SubQueues:  subQueues,
-		Response:   resp,
-		Deployment: deployment,
-		Mode:       resp.Deployment.Mode,
+		Name:         queueName,
+		Priority:     resp.Queue.Priority,
+		SubQueues:    subQueues,
+		Response:     resp,
+		Deployment:   deployment,
+		Mode:         resp.Deployment.Mode,
+		RedisStorage: resp.Deployment.RedisStorage,
 	}
 	if state.Mode == "" {
 		state.Mode = "long_running"
@@ -236,6 +238,7 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 			resp.Deployment.EnvVars,
 			resp.Vaults,
 			resp.Deployment.StartupTimeoutSecs,
+			resp.Deployment.RedisStorage,
 			w.logger,
 		)
 		// Register handler for ALL sub-queues
@@ -256,7 +259,7 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 		w.logger.Info("[%s] Supervised process started and ready", queueName)
 
 		// Create stdio handler for communication with supervised process
-		state.StdioHandler = NewStdioHandler(state.Supervisor.Stdin(), state.Supervisor.Stdout(), w.logger)
+		state.StdioHandler = NewStdioHandler(state.Supervisor.Stdin(), state.Supervisor.Stdout(), w.logger, resp.Deployment.RedisStorage)
 		state.StdioHandler.Start()
 		// Register handler for ALL sub-queues
 		for _, sq := range subQueues {

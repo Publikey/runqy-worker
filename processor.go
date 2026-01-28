@@ -10,12 +10,13 @@ import (
 
 // processor handles dequeuing and executing tasks.
 type processor struct {
-	redis         *redisClient
-	handler       Handler                // fallback handler (ServeMux for type-based routing)
-	queueHandlers map[string]HandlerFunc // queue name -> handler (for queue-based routing)
-	config        Config
-	queues        []string               // Queue names in priority order
-	queueStates   map[string]*QueueState // supervised processes per queue (may be nil)
+	redis            *redisClient
+	handler          Handler                // fallback handler (ServeMux for type-based routing)
+	queueHandlers    map[string]HandlerFunc // queue name -> handler (for queue-based routing)
+	config           Config
+	queues           []string               // Queue names in priority order
+	queueStates      map[string]*QueueState // supervised processes per queue (may be nil)
+	subQueueToState  map[string]*QueueState // sub-queue name -> parent queue state
 
 	done   chan struct{}
 	ctx    context.Context
@@ -48,6 +49,13 @@ func (p *processor) SetQueueHandler(queue string, handler HandlerFunc) {
 // SetQueueStates sets the queue states for per-queue health checks.
 func (p *processor) SetQueueStates(queueStates map[string]*QueueState) {
 	p.queueStates = queueStates
+	// Build reverse lookup from sub-queue names to parent queue state
+	p.subQueueToState = make(map[string]*QueueState)
+	for _, state := range queueStates {
+		for _, sq := range state.SubQueues {
+			p.subQueueToState[sq.Name] = state
+		}
+	}
 }
 
 // buildQueueList creates a weighted list of queues for round-robin selection.
@@ -150,8 +158,24 @@ func (p *processor) processOne(ctx context.Context) {
 
 // handleSuccess handles successful task completion.
 func (p *processor) handleSuccess(ctx context.Context, task *Task, queueName string) {
-	if err := p.redis.complete(ctx, task, queueName); err != nil {
-		p.logger.Error("Failed to mark task complete: %v", err)
+	// Check if redis storage is enabled for this queue
+	storeInRedis := true
+	if state, ok := p.subQueueToState[queueName]; ok {
+		storeInRedis = state.RedisStorage
+	}
+
+	if storeInRedis {
+		if err := p.redis.complete(ctx, task, queueName); err != nil {
+			p.logger.Error("Failed to mark task complete: %v", err)
+		}
+	} else {
+		// Just clean up the active queue without storing completion
+		if err := p.redis.cleanupActive(ctx, task, queueName); err != nil {
+			p.logger.Error("Failed to cleanup active task: %v", err)
+		}
+	}
+	if err := p.redis.incrementProcessed(ctx, queueName); err != nil {
+		p.logger.Error("Failed to increment processed counter: %v", err)
 	}
 	p.logger.Info(fmt.Sprintf("Task %s completed successfully", task.id))
 }
@@ -160,11 +184,26 @@ func (p *processor) handleSuccess(ctx context.Context, task *Task, queueName str
 func (p *processor) handleError(ctx context.Context, task *Task, queueName string, err error) {
 	p.logger.Error(fmt.Sprintf("Task %s failed: %v", task.id, err))
 
+	// Check if redis storage is enabled for this queue
+	storeInRedis := true
+	if state, ok := p.subQueueToState[queueName]; ok {
+		storeInRedis = state.RedisStorage
+	}
+
 	// Check for permanent failure (skip retry)
 	if IsSkipRetry(err) {
 		p.logger.Warn(fmt.Sprintf("Task %s marked as permanent failure, skipping retry", task.id))
-		if failErr := p.redis.fail(ctx, task, queueName, err.Error()); failErr != nil {
-			p.logger.Error("Failed to mark task as failed: %v", failErr)
+		if storeInRedis {
+			if failErr := p.redis.fail(ctx, task, queueName, err.Error()); failErr != nil {
+				p.logger.Error("Failed to mark task as failed: %v", failErr)
+			}
+		} else {
+			if cleanupErr := p.redis.cleanupActive(ctx, task, queueName); cleanupErr != nil {
+				p.logger.Error("Failed to cleanup active task: %v", cleanupErr)
+			}
+		}
+		if incrErr := p.redis.incrementFailed(ctx, queueName); incrErr != nil {
+			p.logger.Error("Failed to increment failed counter: %v", incrErr)
 		}
 		return
 	}
@@ -187,8 +226,17 @@ func (p *processor) handleError(ctx context.Context, task *Task, queueName strin
 	} else {
 		p.logger.Warn(fmt.Sprintf("Task %s exceeded max retries (%d), marking as failed", task.id, task.maxRetry))
 
-		if failErr := p.redis.fail(ctx, task, queueName, err.Error()); failErr != nil {
-			p.logger.Error("Failed to mark task as failed: %v", failErr)
+		if storeInRedis {
+			if failErr := p.redis.fail(ctx, task, queueName, err.Error()); failErr != nil {
+				p.logger.Error("Failed to mark task as failed: %v", failErr)
+			}
+		} else {
+			if cleanupErr := p.redis.cleanupActive(ctx, task, queueName); cleanupErr != nil {
+				p.logger.Error("Failed to cleanup active task: %v", cleanupErr)
+			}
+		}
+		if incrErr := p.redis.incrementFailed(ctx, queueName); incrErr != nil {
+			p.logger.Error("Failed to increment failed counter: %v", incrErr)
 		}
 	}
 }
