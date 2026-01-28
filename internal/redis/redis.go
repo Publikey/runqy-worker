@@ -33,6 +33,12 @@ const (
 	KeyTask       = KeyPrefix + "{%s}:t:%s"      // Task data hash: asynq:{queue}:t:{taskID}
 	KeyWorkers    = KeyPrefix + "workers"        // Set of worker IDs
 	KeyWorkerData = KeyPrefix + "workers:%s"     // Worker data hash
+
+	// Stats keys
+	KeyProcessed      = KeyPrefix + "{%s}:processed"    // Total processed count by queue
+	KeyFailed         = KeyPrefix + "{%s}:failed"       // Total failed count by queue
+	KeyProcessedDaily = KeyPrefix + "{%s}:processed:%s" // Daily processed count: asynq:{queue}:processed:YYYY-MM-DD
+	KeyFailedDaily    = KeyPrefix + "{%s}:failed:%s"    // Daily failed count: asynq:{queue}:failed:YYYY-MM-DD
 )
 
 // Task data fields in Redis hash (asynq-compatible)
@@ -452,4 +458,45 @@ func (r *Client) Ping(ctx context.Context) error {
 // GetRedisClient returns the underlying redis client for advanced operations.
 func (r *Client) GetRedisClient() *redis.Client {
 	return r.Rdb
+}
+
+// CleanupActive removes a task from active queue without storing completion data.
+// Used when redis_storage is disabled.
+func (r *Client) CleanupActive(ctx context.Context, taskID string, queueName string) error {
+	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
+	activeKey := fmt.Sprintf(KeyActive, queueName)
+	leaseKey := fmt.Sprintf(KeyLease, queueName)
+
+	// Remove from active queue (List) and lease tracking (Sorted Set)
+	r.Rdb.LRem(ctx, activeKey, 1, taskID)
+	r.Rdb.ZRem(ctx, leaseKey, taskID)
+
+	// Delete the task hash entirely
+	r.Rdb.Del(ctx, taskKey)
+
+	return nil
+}
+
+// IncrementProcessed increments both total and daily processed counters for a queue.
+func (r *Client) IncrementProcessed(ctx context.Context, queueName string) error {
+	totalKey := fmt.Sprintf(KeyProcessed, queueName)
+	dailyKey := fmt.Sprintf(KeyProcessedDaily, queueName, time.Now().UTC().Format("2006-01-02"))
+
+	pipe := r.Rdb.Pipeline()
+	pipe.Incr(ctx, totalKey)
+	pipe.Incr(ctx, dailyKey)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// IncrementFailed increments both total and daily failed counters for a queue.
+func (r *Client) IncrementFailed(ctx context.Context, queueName string) error {
+	totalKey := fmt.Sprintf(KeyFailed, queueName)
+	dailyKey := fmt.Sprintf(KeyFailedDaily, queueName, time.Now().UTC().Format("2006-01-02"))
+
+	pipe := r.Rdb.Pipeline()
+	pipe.Incr(ctx, totalKey)
+	pipe.Incr(ctx, dailyKey)
+	_, err := pipe.Exec(ctx)
+	return err
 }

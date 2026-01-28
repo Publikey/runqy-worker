@@ -98,9 +98,9 @@ type StdioHandler struct {
 
 // NewStdioHandler creates a StdioHandler from stdin/stdout pipes.
 // Call Start() to begin reading responses, and Stop() to clean up.
-func NewStdioHandler(stdin io.Writer, stdout io.Reader, logger Logger) *StdioHandler {
+func NewStdioHandler(stdin io.Writer, stdout io.Reader, logger Logger, redisStorage bool) *StdioHandler {
 	return &StdioHandler{
-		internal: handler.NewStdioHandler(stdin, stdout, &loggerAdapter{logger}),
+		internal: handler.NewStdioHandler(stdin, stdout, &loggerAdapter{logger}, redisStorage),
 	}
 }
 
@@ -132,6 +132,7 @@ func NewOneShotHandler(
 	startupCmd string,
 	envVars map[string]string,
 	timeoutSecs int,
+	redisStorage bool,
 	logger Logger,
 ) *OneShotHandler {
 	timeout := time.Duration(timeoutSecs) * time.Second
@@ -145,6 +146,7 @@ func NewOneShotHandler(
 			startupCmd,
 			envVars,
 			timeout,
+			redisStorage,
 			&loggerAdapter{logger},
 		),
 	}
