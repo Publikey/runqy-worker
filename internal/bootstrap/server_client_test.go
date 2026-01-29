@@ -61,7 +61,6 @@ func TestBootstrapRequest(t *testing.T) {
 				GitURL:             "https://github.com/test/repo.git",
 				Branch:             "main",
 				StartupCmd:         "uvicorn app:app",
-				EnvVars:            map[string]string{"KEY": "value"},
 				StartupTimeoutSecs: 60,
 			},
 		}

@@ -20,7 +20,6 @@ type ProcessSupervisor struct {
 	cmd        *exec.Cmd
 	deployment *DeploymentResult
 	startupCmd string
-	envVars    map[string]string
 	vaultVars  map[string]string // Vault entries to inject as environment variables
 	timeoutSec int
 	logger     Logger
@@ -50,7 +49,6 @@ func NewProcessSupervisor(deployment *DeploymentResult, spec DeploymentConfig, v
 	return &ProcessSupervisor{
 		deployment: deployment,
 		startupCmd: spec.StartupCmd,
-		envVars:    spec.EnvVars,
 		vaultVars:  vaultVars,
 		timeoutSec: timeout,
 		logger:     logger,
@@ -240,13 +238,8 @@ func (s *ProcessSupervisor) buildEnvironment() []string {
 	// Add VIRTUAL_ENV
 	env = append(env, "VIRTUAL_ENV="+s.deployment.VenvPath)
 
-	// Add vault environment variables first (can be overridden by spec env_vars)
+	// Add vault environment variables
 	for k, v := range s.vaultVars {
-		env = append(env, k+"="+v)
-	}
-
-	// Add custom environment variables from spec (overrides vault vars if same key)
-	for k, v := range s.envVars {
 		env = append(env, k+"="+v)
 	}
 
