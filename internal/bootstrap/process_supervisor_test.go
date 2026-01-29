@@ -87,8 +87,7 @@ func TestProcessSupervisorConstruction(t *testing.T) {
 	}
 
 	logger := newTestLogger()
-	vaultVars := map[string]string{"KEY": "value"}
-	supervisor := NewProcessSupervisor(deployment, spec, vaultVars, logger)
+	supervisor := NewProcessSupervisor(deployment, spec, nil, logger)
 
 	if supervisor.deployment != deployment {
 		t.Error("deployment not set correctly")

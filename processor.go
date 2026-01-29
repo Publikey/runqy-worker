@@ -70,9 +70,9 @@ func buildQueueList(queueWeights map[string]int) []string {
 }
 
 // parentQueueName extracts the parent queue name from a sub-queue name.
-// For example: "inference:high" -> "inference", "simple" -> "simple"
+// For example: "inference.high" -> "inference", "simple" -> "simple"
 func parentQueueName(subQueueName string) string {
-	if idx := strings.Index(subQueueName, ":"); idx > 0 {
+	if idx := strings.Index(subQueueName, "."); idx > 0 {
 		return subQueueName[:idx]
 	}
 	return subQueueName
