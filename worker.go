@@ -191,6 +191,10 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 	}
 
 	// Phase 2: Deploy code for this queue
+	// Pass git token from server response (resolved from vault) for authentication
+	if resp.GitToken != "" {
+		queueConfig.GitToken = resp.GitToken
+	}
 	w.logger.Info("[%s] Deploying code from %s (branch: %s)...", queueName, resp.Deployment.GitURL, resp.Deployment.Branch)
 	deployment, err := deployCode(ctx, queueConfig, resp.Deployment, w.logger)
 	if err != nil {
@@ -235,7 +239,6 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 			deployment.CodePath, // Use CodePath (includes code_path subdirectory)
 			deployment.VenvPath,
 			resp.Deployment.StartupCmd,
-			resp.Deployment.EnvVars,
 			resp.Vaults,
 			resp.Deployment.StartupTimeoutSecs,
 			resp.Deployment.RedisStorage,

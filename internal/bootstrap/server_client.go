@@ -39,7 +39,8 @@ type Response struct {
 	Queue      QueueConfig       `json:"queue"`
 	SubQueues  []SubQueueConfig  `json:"sub_queues"`
 	Deployment DeploymentConfig  `json:"deployment"`
-	Vaults     map[string]string `json:"vaults,omitempty"` // Decrypted vault key-value pairs for env injection
+	Vaults     map[string]string `json:"vaults,omitempty"`    // Decrypted vault key-value pairs for env injection
+	GitToken   string            `json:"git_token,omitempty"` // Resolved git token for authentication
 }
 
 // RedisConfig holds Redis connection settings from server.
@@ -64,14 +65,13 @@ type SubQueueConfig struct {
 
 // DeploymentConfig holds code deployment settings from server.
 type DeploymentConfig struct {
-	GitURL             string            `json:"git_url"`              // Repository URL
-	Branch             string            `json:"branch"`               // Git branch/tag
-	CodePath           string            `json:"code_path"`            // Subdirectory where task code lives (enables sparse checkout)
-	StartupCmd         string            `json:"startup_cmd"`          // Command to start process
-	RedisStorage       bool              `json:"redis_storage"`        // Write the result on redis or not
-	EnvVars            map[string]string `json:"env_vars"`             // Environment variables
-	StartupTimeoutSecs int               `json:"startup_timeout_secs"` // Timeout for ready signal
-	Mode               string            `json:"mode"`                 // "long_running" (default) or "one_shot"
+	GitURL             string `json:"git_url"`              // Repository URL
+	Branch             string `json:"branch"`               // Git branch/tag
+	CodePath           string `json:"code_path"`            // Subdirectory where task code lives (enables sparse checkout)
+	StartupCmd         string `json:"startup_cmd"`          // Command to start process
+	RedisStorage       bool   `json:"redis_storage"`        // Write the result on redis or not
+	StartupTimeoutSecs int    `json:"startup_timeout_secs"` // Timeout for ready signal
+	Mode               string `json:"mode"`                 // "long_running" (default) or "one_shot"
 }
 
 // Request contains worker metadata sent to server during registration.

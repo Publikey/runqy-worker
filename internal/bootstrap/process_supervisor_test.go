@@ -83,7 +83,6 @@ func TestProcessSupervisorConstruction(t *testing.T) {
 		GitURL:             "https://github.com/test/repo.git",
 		Branch:             "main",
 		StartupCmd:         "uvicorn app:app --port 8080",
-		EnvVars:            map[string]string{"KEY": "value"},
 		StartupTimeoutSecs: 120,
 	}
 
@@ -99,8 +98,8 @@ func TestProcessSupervisorConstruction(t *testing.T) {
 	if supervisor.timeoutSec != 120 {
 		t.Errorf("timeoutSec = %d, want 120", supervisor.timeoutSec)
 	}
-	if supervisor.envVars["KEY"] != "value" {
-		t.Error("envVars not set correctly")
+	if supervisor.vaultVars["KEY"] != "value" {
+		t.Error("vaultVars not set correctly")
 	}
 	if supervisor.healthy {
 		t.Error("supervisor should not be healthy initially")
