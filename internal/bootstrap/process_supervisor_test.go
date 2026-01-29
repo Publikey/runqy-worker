@@ -88,7 +88,7 @@ func TestProcessSupervisorConstruction(t *testing.T) {
 	}
 
 	logger := newTestLogger()
-	supervisor := NewProcessSupervisor(deployment, spec, logger)
+	supervisor := NewProcessSupervisor(deployment, spec, nil, logger)
 
 	if supervisor.deployment != deployment {
 		t.Error("deployment not set correctly")
@@ -117,7 +117,7 @@ func TestProcessSupervisorDefaultTimeout(t *testing.T) {
 	}
 
 	logger := newTestLogger()
-	supervisor := NewProcessSupervisor(deployment, spec, logger)
+	supervisor := NewProcessSupervisor(deployment, spec, nil, logger)
 
 	if supervisor.timeoutSec != 60 {
 		t.Errorf("expected default timeout 60, got %d", supervisor.timeoutSec)

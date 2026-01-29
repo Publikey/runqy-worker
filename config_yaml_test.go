@@ -262,9 +262,14 @@ func TestExpandEnvVars(t *testing.T) {
 }
 
 func TestLoadConfigFileNotFound(t *testing.T) {
-	_, err := LoadConfig("/nonexistent/path/config.yml")
-	if err == nil {
-		t.Error("expected error for nonexistent file")
+	// When config file is not found, LoadConfig falls back to environment variables
+	// and returns a valid config (no error)
+	cfg, err := LoadConfig("/nonexistent/path/config.yml")
+	if err != nil {
+		t.Errorf("unexpected error: %v (LoadConfig should fall back to env vars)", err)
+	}
+	if cfg == nil {
+		t.Error("expected config from env vars fallback, got nil")
 	}
 }
 

@@ -203,7 +203,7 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 		// Backward compatibility: if server doesn't return sub_queues,
 		// create default sub-queue from queue config
 		subQueues = []BootstrapSubQueueConfig{{
-			Name:     queueName + ":default",
+			Name:     queueName + ".default",
 			Priority: resp.Queue.Priority,
 		}}
 	}
@@ -548,7 +548,7 @@ func (w *Worker) GetServeMux() *ServeMux {
 }
 
 // formatQueues formats the queue weights map for display.
-// Output: "inference:high (9), simple:default (3), inference:low (1)"
+// Output: "inference.high (9), simple.default (3), inference.low (1)"
 func formatQueues(queues map[string]int) string {
 	if len(queues) == 0 {
 		return "(none)"
