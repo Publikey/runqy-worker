@@ -100,15 +100,8 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 	gitURL := spec.GitURL
 	var env []string
 
-	// Resolve git token: local config takes precedence, then server-provided env var
+	// Use git token from config (resolved from vault by server)
 	gitToken := config.GitToken
-	if gitToken == "" {
-		if token, ok := spec.EnvVars["github_token"]; ok && token != "" {
-			gitToken = token
-		} else if token, ok := spec.EnvVars["GITHUB_TOKEN"]; ok && token != "" {
-			gitToken = token
-		}
-	}
 
 	if config.GitSSHKey != "" {
 		// SSH key authentication
