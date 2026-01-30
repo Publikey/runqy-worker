@@ -37,11 +37,15 @@ type Worker struct {
 	mux           *ServeMux
 	processor     *processor
 	heartbeat     *heartbeat
+	reconnector   *redisReconnector
 	queueHandlers map[string]HandlerFunc // stored until processor is created
 
 	// Multi-queue bootstrap state
 	queueStates  map[string]*QueueState
 	bootstrapped bool
+
+	// Redis connection config (stored during bootstrap for reconnection)
+	redisConnConfig *RedisConnConfig
 
 	done   chan struct{}
 	wg     sync.WaitGroup
@@ -76,6 +80,7 @@ func New(cfg Config) *Worker {
 
 	// Redis client is created during Bootstrap() or can be set directly
 	var rdb *redis.Client
+	var redisConnConfig *RedisConnConfig
 	if cfg.RedisAddr != "" && cfg.ServerURL == "" {
 		opts := &redis.Options{
 			Addr:     cfg.RedisAddr,
@@ -86,14 +91,23 @@ func New(cfg Config) *Worker {
 			opts.TLSConfig = cfg.RedisTLS
 		}
 		rdb = redis.NewClient(opts)
+
+		// Store config for reconnection
+		redisConnConfig = &RedisConnConfig{
+			Addr:     cfg.RedisAddr,
+			Password: cfg.RedisPassword,
+			DB:       cfg.RedisDB,
+			UseTLS:   cfg.RedisTLS != nil,
+		}
 	}
 
 	return &Worker{
-		config: cfg,
-		rdb:    rdb,
-		mux:    NewServeMux(),
-		done:   make(chan struct{}),
-		logger: cfg.Logger,
+		config:          cfg,
+		rdb:             rdb,
+		redisConnConfig: redisConnConfig,
+		mux:             NewServeMux(),
+		done:            make(chan struct{}),
+		logger:          cfg.Logger,
 	}
 }
 
@@ -141,6 +155,15 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 		// Create Redis client from first queue response (all should have same Redis config)
 		if w.rdb == nil {
 			w.logger.Info("Connecting to Redis at %s...", state.Response.Redis.Addr)
+
+			// Store Redis config for later reconnection
+			w.redisConnConfig = &RedisConnConfig{
+				Addr:     state.Response.Redis.Addr,
+				Password: state.Response.Redis.Password,
+				DB:       state.Response.Redis.DB,
+				UseTLS:   state.Response.Redis.UseTLS,
+			}
+
 			opts := &redis.Options{
 				Addr:     state.Response.Redis.Addr,
 				Password: state.Response.Redis.Password,
@@ -416,6 +439,20 @@ func (w *Worker) Run() error {
 		w.processor.SetQueueHandler(queue, handler)
 	}
 
+	// Initialize reconnector if we have Redis config (from bootstrap)
+	if w.redisConnConfig != nil {
+		w.logger.Info("Redis reconnection enabled (addr=%s)", w.redisConnConfig.Addr)
+		w.reconnector = newRedisReconnector(*w.redisConnConfig, w.rdb, w.logger)
+		w.reconnector.SetOnReconnect(func(client *redis.Client) {
+			w.rdb = client
+			w.heartbeat.updateClient(client)
+			w.processor.updateClient(client, w.logger)
+		})
+		w.processor.SetReconnector(w.reconnector)
+	} else {
+		w.logger.Warn("Redis reconnection disabled (no connection config stored)")
+	}
+
 	// Start components
 	w.heartbeat.start()
 	w.processor.start()
@@ -472,6 +509,20 @@ func (w *Worker) Start(ctx context.Context) error {
 	// Copy queue handlers to processor
 	for queue, handler := range w.queueHandlers {
 		w.processor.SetQueueHandler(queue, handler)
+	}
+
+	// Initialize reconnector if we have Redis config (from bootstrap)
+	if w.redisConnConfig != nil {
+		w.logger.Info("Redis reconnection enabled (addr=%s)", w.redisConnConfig.Addr)
+		w.reconnector = newRedisReconnector(*w.redisConnConfig, w.rdb, w.logger)
+		w.reconnector.SetOnReconnect(func(client *redis.Client) {
+			w.rdb = client
+			w.heartbeat.updateClient(client)
+			w.processor.updateClient(client, w.logger)
+		})
+		w.processor.SetReconnector(w.reconnector)
+	} else {
+		w.logger.Warn("Redis reconnection disabled (no connection config stored)")
 	}
 
 	// Start components

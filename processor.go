@@ -6,17 +6,21 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // processor handles dequeuing and executing tasks.
 type processor struct {
 	redis            *redisClient
+	redisMu          sync.RWMutex           // protects redis client during reconnection
 	handler          Handler                // fallback handler (ServeMux for type-based routing)
 	queueHandlers    map[string]HandlerFunc // queue name -> handler (for queue-based routing)
 	config           Config
 	queues           []string               // Queue names in priority order
 	queueStates      map[string]*QueueState // supervised processes per queue (may be nil)
 	subQueueToState  map[string]*QueueState // sub-queue name -> parent queue state
+	reconnector      *redisReconnector      // for connection recovery
 
 	done   chan struct{}
 	ctx    context.Context
@@ -56,6 +60,18 @@ func (p *processor) SetQueueStates(queueStates map[string]*QueueState) {
 			p.subQueueToState[sq.Name] = state
 		}
 	}
+}
+
+// SetReconnector sets the reconnection manager for the processor.
+func (p *processor) SetReconnector(r *redisReconnector) {
+	p.reconnector = r
+}
+
+// updateClient updates the Redis client after reconnection.
+func (p *processor) updateClient(client *redis.Client, logger Logger) {
+	p.redisMu.Lock()
+	defer p.redisMu.Unlock()
+	p.redis = newRedisClient(client, logger)
 }
 
 // buildQueueList creates a weighted list of queues for round-robin selection.
@@ -109,18 +125,41 @@ func (p *processor) worker(id int) {
 
 // processOne attempts to dequeue and process a single task.
 func (p *processor) processOne(ctx context.Context) {
-	// ctx := context.Background()
+	// Get redis client with read lock
+	p.redisMu.RLock()
+	redisClient := p.redis
+	p.redisMu.RUnlock()
+
 	// Dequeue a task
-	task, err := p.redis.dequeue(ctx, p.queues)
+	task, err := redisClient.dequeue(ctx, p.queues)
 	if err != nil {
 		p.logger.Error("Dequeue error: %v", err)
-		time.Sleep(time.Second) // Back off on error
+
+		// Check if this is a connection error and handle reconnection
+		if p.reconnector != nil {
+			if p.reconnector.handleError(err) {
+				// Reconnection was attempted, back off longer
+				time.Sleep(5 * time.Second)
+			} else {
+				time.Sleep(time.Second) // Back off on error
+			}
+		} else {
+			p.logger.Debug("No reconnector configured, cannot auto-recover")
+			time.Sleep(time.Second) // Back off on error
+		}
 		return
 	}
 
 	if task == nil {
 		// No task available, will retry after BRPOP timeout
+		// Note: Don't reset error count here - a successful BRPOP timeout
+		// doesn't mean the connection is healthy for write operations
 		return
+	}
+
+	// Reset consecutive errors only when we actually dequeue a task
+	if p.reconnector != nil {
+		p.reconnector.resetErrors()
 	}
 
 	queueName := task.queue
