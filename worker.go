@@ -151,7 +151,62 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 	}
 	sort.Strings(uniqueParents)
 
-	// Bootstrap once per unique parent (instead of per queue name)
+	// Phase 1: Contact server for first queue to get Redis credentials early
+	// This allows us to register as "bootstrapping" before code deployment starts
+	firstParent := uniqueParents[0]
+	firstQueueConfig := w.config
+	firstQueueConfig.Queue = firstParent
+
+	w.logger.Info("Contacting server to get Redis credentials...")
+	firstResp, err := doBootstrap(ctx, firstQueueConfig, w.logger)
+	if err != nil {
+		return fmt.Errorf("failed to contact server for initial config: %w", err)
+	}
+
+	// Phase 2: Connect to Redis and register as "bootstrapping" BEFORE code deployment
+	w.logger.Info("Connecting to Redis at %s...", firstResp.Redis.Addr)
+
+	// Store Redis config for later reconnection
+	w.redisConnConfig = &RedisConnConfig{
+		Addr:     firstResp.Redis.Addr,
+		Password: firstResp.Redis.Password,
+		DB:       firstResp.Redis.DB,
+		UseTLS:   firstResp.Redis.UseTLS,
+	}
+
+	opts := &redis.Options{
+		Addr:     firstResp.Redis.Addr,
+		Password: firstResp.Redis.Password,
+		DB:       firstResp.Redis.DB,
+	}
+	if firstResp.Redis.UseTLS {
+		opts.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+	w.rdb = redis.NewClient(opts)
+
+	// Test Redis connection
+	if err := w.rdb.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("failed to connect to Redis: %w", err)
+	}
+	w.logger.Info("Redis connection successful")
+
+	// Initialize queues with parent queue names for early heartbeat
+	// Priority 0 indicates "bootstrapping, priority unknown"
+	// This will be replaced with actual sub-queues and priorities after bootstrap
+	w.config.Queues = make(map[string]int)
+	for _, parent := range uniqueParents {
+		w.config.Queues[parent] = 0
+	}
+
+	// Start early heartbeat with "bootstrapping" status
+	// This makes the worker visible in Redis while deploying code
+	w.heartbeat = newHeartbeat(w.rdb, w.config, nil, "bootstrapping")
+	w.heartbeat.start()
+	w.logger.Info("Worker registered as bootstrapping")
+
+	// Phase 3: Bootstrap each queue (deploy code, start processes)
 	for i, parentQueue := range uniqueParents {
 		group := parentGroups[parentQueue]
 		if group.listenAll {
@@ -162,47 +217,24 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 				i+1, len(uniqueParents), parentQueue, group.configuredSQs)
 		}
 
-		state, err := w.bootstrapQueue(ctx, group)
+		// For first queue, reuse the server response we already have
+		var state *QueueState
+		if i == 0 {
+			state, err = w.bootstrapQueueWithResponse(ctx, group, firstResp)
+		} else {
+			state, err = w.bootstrapQueue(ctx, group)
+		}
 		if err != nil {
-			// Clean up already-bootstrapped queues
+			// Clean up already-bootstrapped queues and stop heartbeat
 			w.cleanupQueueStates()
+			if w.heartbeat != nil {
+				w.heartbeat.stop()
+			}
 			return fmt.Errorf("failed to bootstrap queue %s: %w", parentQueue, err)
 		}
 
 		// Key by PARENT queue name for shared runtime lookup
 		w.queueStates[parentQueue] = state
-
-		// Create Redis client from first queue response (all should have same Redis config)
-		if w.rdb == nil {
-			w.logger.Info("Connecting to Redis at %s...", state.Response.Redis.Addr)
-
-			// Store Redis config for later reconnection
-			w.redisConnConfig = &RedisConnConfig{
-				Addr:     state.Response.Redis.Addr,
-				Password: state.Response.Redis.Password,
-				DB:       state.Response.Redis.DB,
-				UseTLS:   state.Response.Redis.UseTLS,
-			}
-
-			opts := &redis.Options{
-				Addr:     state.Response.Redis.Addr,
-				Password: state.Response.Redis.Password,
-				DB:       state.Response.Redis.DB,
-			}
-			if state.Response.Redis.UseTLS {
-				opts.TLSConfig = &tls.Config{
-					MinVersion: tls.VersionTLS12,
-				}
-			}
-			w.rdb = redis.NewClient(opts)
-
-			// Test Redis connection
-			if err := w.rdb.Ping(ctx).Err(); err != nil {
-				w.cleanupQueueStates()
-				return fmt.Errorf("failed to connect to Redis: %w", err)
-			}
-			w.logger.Info("Redis connection successful")
-		}
 	}
 
 	// Build aggregated queue weights map from all SUB-queues
@@ -211,6 +243,14 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 		for _, sq := range state.SubQueues {
 			w.config.Queues[sq.Name] = sq.Priority
 		}
+	}
+
+	// Update heartbeat with queue states, queues config, and transition to "running"
+	if w.heartbeat != nil {
+		w.heartbeat.updateQueueStates(w.queueStates)
+		w.heartbeat.SetStatus("running") // Set status first
+		w.heartbeat.updateQueues(w.config.Queues) // Then re-register with correct queues and status
+		w.logger.Info("Bootstrap complete, worker status: running")
 	}
 
 	w.bootstrapped = true
@@ -274,8 +314,6 @@ func (w *Worker) bootstrapQueue(ctx context.Context, group *parentQueueGroup) (*
 	// Create queue-specific config for bootstrap
 	queueConfig := w.config
 	queueConfig.Queue = parentQueue // Use PARENT queue for server registration
-	// Use PARENT queue for deployment directory (ensures deduplication across sub-queues)
-	queueConfig.DeploymentDir = filepath.Join(w.config.DeploymentDir, parentQueue)
 
 	// Phase 1: Contact server for this parent queue
 	w.logger.Info("[%s] Contacting server...", parentQueue)
@@ -284,7 +322,22 @@ func (w *Worker) bootstrapQueue(ctx context.Context, group *parentQueueGroup) (*
 		return nil, fmt.Errorf("server bootstrap failed: %w", err)
 	}
 
-	// Phase 2: Deploy code for this parent queue (once, shared by all sub-queues)
+	// Continue with code deployment and handler setup
+	return w.bootstrapQueueWithResponse(ctx, group, resp)
+}
+
+// bootstrapQueueWithResponse handles bootstrap for a queue using a pre-fetched server response.
+// This is used when we already have the server response (e.g., from early Redis credential fetch).
+func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQueueGroup, resp *BootstrapResponse) (*QueueState, error) {
+	parentQueue := group.parent
+
+	// Create queue-specific config for bootstrap
+	queueConfig := w.config
+	queueConfig.Queue = parentQueue
+	// Use PARENT queue for deployment directory (ensures deduplication across sub-queues)
+	queueConfig.DeploymentDir = filepath.Join(w.config.DeploymentDir, parentQueue)
+
+	// Deploy code for this parent queue (once, shared by all sub-queues)
 	// Pass git token from server response (resolved from vault) for authentication
 	if resp.GitToken != "" {
 		queueConfig.GitToken = resp.GitToken
@@ -352,7 +405,7 @@ func (w *Worker) bootstrapQueue(ctx context.Context, group *parentQueueGroup) (*
 		state.Mode = "long_running"
 	}
 
-	// Phase 3: Set up handler based on mode (single runtime shared by all sub-queues)
+	// Set up handler based on mode (single runtime shared by all sub-queues)
 	w.logger.Info("[%s] Deployment mode: %s", parentQueue, state.Mode)
 
 	switch state.Mode {
@@ -549,7 +602,11 @@ func (w *Worker) Run() error {
 	// Create components
 	redisClient := newRedisClient(w.rdb, w.logger)
 	w.processor = newProcessor(redisClient, w.mux, w.config)
-	w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates)
+
+	// Only create heartbeat if not already started during bootstrap
+	if w.heartbeat == nil {
+		w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates, "running")
+	}
 
 	// Set queue states for per-queue health checks
 	w.processor.SetQueueStates(w.queueStates)
@@ -573,8 +630,10 @@ func (w *Worker) Run() error {
 		w.logger.Warn("Redis reconnection disabled (no connection config stored)")
 	}
 
-	// Start components
-	w.heartbeat.start()
+	// Start components (heartbeat may already be running from bootstrap)
+	if !w.heartbeat.isRunning() {
+		w.heartbeat.start()
+	}
 	w.processor.start()
 
 	w.logger.Info("Worker running. Press Ctrl+C to stop.")
@@ -621,7 +680,11 @@ func (w *Worker) Start(ctx context.Context) error {
 	// Create components
 	redisClient := newRedisClient(w.rdb, w.logger)
 	w.processor = newProcessor(redisClient, w.mux, w.config)
-	w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates)
+
+	// Only create heartbeat if not already started during bootstrap
+	if w.heartbeat == nil {
+		w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates, "running")
+	}
 
 	// Set queue states for per-queue health checks
 	w.processor.SetQueueStates(w.queueStates)
@@ -645,8 +708,10 @@ func (w *Worker) Start(ctx context.Context) error {
 		w.logger.Warn("Redis reconnection disabled (no connection config stored)")
 	}
 
-	// Start components
-	w.heartbeat.start()
+	// Start components (heartbeat may already be running from bootstrap)
+	if !w.heartbeat.isRunning() {
+		w.heartbeat.start()
+	}
 	w.processor.start()
 
 	w.logger.Info("Worker running.")

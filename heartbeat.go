@@ -21,13 +21,21 @@ type heartbeat struct {
 	logger      Logger
 	config      Config
 	queueStates map[string]*QueueState // supervised processes (may be nil or empty)
+	status      string                 // current status ("bootstrapping" or "running")
+	statusMu    sync.RWMutex           // protects status field
+	started     bool                   // whether heartbeat loop has been started
 }
 
 // newHeartbeat creates a new heartbeat sender.
-func newHeartbeat(rdb *redis.Client, cfg Config, queueStates map[string]*QueueState) *heartbeat {
+// initialStatus should be "bootstrapping" or "running".
+func newHeartbeat(rdb *redis.Client, cfg Config, queueStates map[string]*QueueState, initialStatus string) *heartbeat {
 	hostname, _ := os.Hostname()
 	pid := os.Getpid()
 	workerID := fmt.Sprintf("%s:%d", hostname, pid)
+
+	if initialStatus == "" {
+		initialStatus = "running"
+	}
 
 	return &heartbeat{
 		rdb:         rdb,
@@ -37,13 +45,58 @@ func newHeartbeat(rdb *redis.Client, cfg Config, queueStates map[string]*QueueSt
 		logger:      cfg.Logger,
 		config:      cfg,
 		queueStates: queueStates,
+		status:      initialStatus,
+		started:     false,
 	}
 }
 
 // start begins sending heartbeats.
 func (h *heartbeat) start() {
 	h.wg.Add(1)
+	h.started = true
 	go h.loop()
+}
+
+// isRunning returns true if the heartbeat loop has been started and not stopped.
+func (h *heartbeat) isRunning() bool {
+	if !h.started {
+		return false
+	}
+	select {
+	case <-h.done:
+		return false
+	default:
+		return true
+	}
+}
+
+// SetStatus updates the worker status (e.g., "bootstrapping" -> "running").
+func (h *heartbeat) SetStatus(status string) {
+	h.statusMu.Lock()
+	h.status = status
+	h.statusMu.Unlock()
+}
+
+// getStatus returns the current worker status.
+func (h *heartbeat) getStatus() string {
+	h.statusMu.RLock()
+	defer h.statusMu.RUnlock()
+	return h.status
+}
+
+// updateQueueStates updates the queue states after bootstrap completes.
+func (h *heartbeat) updateQueueStates(queueStates map[string]*QueueState) {
+	h.queueStates = queueStates
+}
+
+// updateQueues updates the queues config and re-registers to update Redis.
+// This should be called after bootstrap completes to update the queue list.
+func (h *heartbeat) updateQueues(queues map[string]int) {
+	h.config.Queues = queues
+	// Re-register to update Redis with correct queue information
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h.register(ctx)
 }
 
 // stop stops sending heartbeats.
@@ -101,7 +154,7 @@ func (h *heartbeat) register(ctx context.Context) {
 		"last_beat":   now,
 		"concurrency": h.config.Concurrency,
 		"queues":      fmt.Sprintf("%v", h.config.Queues),
-		"status":      "running",
+		"status":      h.getStatus(),
 		"healthy":     h.isHealthy(),
 	}
 	if err := rdb.HSet(ctx, workerKey, data).Err(); err != nil {
@@ -126,6 +179,7 @@ func (h *heartbeat) beat(ctx context.Context) {
 
 	if err := rdb.HSet(ctx, workerKey, map[string]interface{}{
 		"last_beat": now,
+		"status":    h.getStatus(),
 		"healthy":   healthy,
 	}).Err(); err != nil {
 		h.logger.Error("Heartbeat HSet failed: %v", err)
