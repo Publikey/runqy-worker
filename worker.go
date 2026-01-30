@@ -37,11 +37,15 @@ type Worker struct {
 	mux           *ServeMux
 	processor     *processor
 	heartbeat     *heartbeat
+	reconnector   *redisReconnector
 	queueHandlers map[string]HandlerFunc // stored until processor is created
 
 	// Multi-queue bootstrap state
 	queueStates  map[string]*QueueState
 	bootstrapped bool
+
+	// Redis connection config (stored during bootstrap for reconnection)
+	redisConnConfig *RedisConnConfig
 
 	done   chan struct{}
 	wg     sync.WaitGroup
@@ -76,6 +80,7 @@ func New(cfg Config) *Worker {
 
 	// Redis client is created during Bootstrap() or can be set directly
 	var rdb *redis.Client
+	var redisConnConfig *RedisConnConfig
 	if cfg.RedisAddr != "" && cfg.ServerURL == "" {
 		opts := &redis.Options{
 			Addr:     cfg.RedisAddr,
@@ -86,14 +91,23 @@ func New(cfg Config) *Worker {
 			opts.TLSConfig = cfg.RedisTLS
 		}
 		rdb = redis.NewClient(opts)
+
+		// Store config for reconnection
+		redisConnConfig = &RedisConnConfig{
+			Addr:     cfg.RedisAddr,
+			Password: cfg.RedisPassword,
+			DB:       cfg.RedisDB,
+			UseTLS:   cfg.RedisTLS != nil,
+		}
 	}
 
 	return &Worker{
-		config: cfg,
-		rdb:    rdb,
-		mux:    NewServeMux(),
-		done:   make(chan struct{}),
-		logger: cfg.Logger,
+		config:          cfg,
+		rdb:             rdb,
+		redisConnConfig: redisConnConfig,
+		mux:             NewServeMux(),
+		done:            make(chan struct{}),
+		logger:          cfg.Logger,
 	}
 }
 
@@ -109,6 +123,8 @@ func NewWithTLS(cfg Config) *Worker {
 
 // Bootstrap contacts the runqy-server, deploys code, and starts supervised processes for all queues.
 // This must be called before Run() when using server-driven configuration.
+// Sub-queues of the same parent (e.g., "manyQueue.high" and "manyQueue.low") share a single
+// code deployment and runtime process.
 func (w *Worker) Bootstrap(ctx context.Context) error {
 	w.logger.Info("Starting multi-queue bootstrap process...")
 
@@ -125,41 +141,100 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 
 	w.queueStates = make(map[string]*QueueState)
 
-	// Bootstrap each queue
-	for i, queueName := range w.config.QueueNames {
-		w.logger.Info("Bootstrapping queue %d/%d: %s", i+1, len(w.config.QueueNames), queueName)
+	// Group configured queues by parent to share deployment and runtime
+	parentGroups := groupQueuesByParent(w.config.QueueNames)
 
-		state, err := w.bootstrapQueue(ctx, queueName)
+	// Get sorted list of unique parents for deterministic ordering
+	var uniqueParents []string
+	for parent := range parentGroups {
+		uniqueParents = append(uniqueParents, parent)
+	}
+	sort.Strings(uniqueParents)
+
+	// Phase 1: Contact server for first queue to get Redis credentials early
+	// This allows us to register as "bootstrapping" before code deployment starts
+	firstParent := uniqueParents[0]
+	firstQueueConfig := w.config
+	firstQueueConfig.Queue = firstParent
+
+	w.logger.Info("Contacting server to get Redis credentials...")
+	firstResp, err := doBootstrap(ctx, firstQueueConfig, w.logger)
+	if err != nil {
+		return fmt.Errorf("failed to contact server for initial config: %w", err)
+	}
+
+	// Phase 2: Connect to Redis and register as "bootstrapping" BEFORE code deployment
+	w.logger.Info("Connecting to Redis at %s...", firstResp.Redis.Addr)
+
+	// Store Redis config for later reconnection
+	w.redisConnConfig = &RedisConnConfig{
+		Addr:     firstResp.Redis.Addr,
+		Password: firstResp.Redis.Password,
+		DB:       firstResp.Redis.DB,
+		UseTLS:   firstResp.Redis.UseTLS,
+	}
+
+	opts := &redis.Options{
+		Addr:     firstResp.Redis.Addr,
+		Password: firstResp.Redis.Password,
+		DB:       firstResp.Redis.DB,
+	}
+	if firstResp.Redis.UseTLS {
+		opts.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+	w.rdb = redis.NewClient(opts)
+
+	// Test Redis connection
+	if err := w.rdb.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("failed to connect to Redis: %w", err)
+	}
+	w.logger.Info("Redis connection successful")
+
+	// Initialize queues with parent queue names for early heartbeat
+	// Priority 0 indicates "bootstrapping, priority unknown"
+	// This will be replaced with actual sub-queues and priorities after bootstrap
+	w.config.Queues = make(map[string]int)
+	for _, parent := range uniqueParents {
+		w.config.Queues[parent] = 0
+	}
+
+	// Start early heartbeat with "bootstrapping" status
+	// This makes the worker visible in Redis while deploying code
+	w.heartbeat = newHeartbeat(w.rdb, w.config, nil, "bootstrapping")
+	w.heartbeat.start()
+	w.logger.Info("Worker registered as bootstrapping")
+
+	// Phase 3: Bootstrap each queue (deploy code, start processes)
+	for i, parentQueue := range uniqueParents {
+		group := parentGroups[parentQueue]
+		if group.listenAll {
+			w.logger.Info("Bootstrapping parent queue %d/%d: %s (listening on ALL sub-queues)",
+				i+1, len(uniqueParents), parentQueue)
+		} else {
+			w.logger.Info("Bootstrapping parent queue %d/%d: %s (listening on specific sub-queues: %v)",
+				i+1, len(uniqueParents), parentQueue, group.configuredSQs)
+		}
+
+		// For first queue, reuse the server response we already have
+		var state *QueueState
+		if i == 0 {
+			state, err = w.bootstrapQueueWithResponse(ctx, group, firstResp)
+		} else {
+			state, err = w.bootstrapQueue(ctx, group)
+		}
 		if err != nil {
-			// Clean up already-bootstrapped queues
+			// Clean up already-bootstrapped queues and stop heartbeat
 			w.cleanupQueueStates()
-			return fmt.Errorf("failed to bootstrap queue %s: %w", queueName, err)
+			if w.heartbeat != nil {
+				w.heartbeat.stop()
+			}
+			return fmt.Errorf("failed to bootstrap queue %s: %w", parentQueue, err)
 		}
 
-		w.queueStates[queueName] = state
-
-		// Create Redis client from first queue response (all should have same Redis config)
-		if w.rdb == nil {
-			w.logger.Info("Connecting to Redis at %s...", state.Response.Redis.Addr)
-			opts := &redis.Options{
-				Addr:     state.Response.Redis.Addr,
-				Password: state.Response.Redis.Password,
-				DB:       state.Response.Redis.DB,
-			}
-			if state.Response.Redis.UseTLS {
-				opts.TLSConfig = &tls.Config{
-					MinVersion: tls.VersionTLS12,
-				}
-			}
-			w.rdb = redis.NewClient(opts)
-
-			// Test Redis connection
-			if err := w.rdb.Ping(ctx).Err(); err != nil {
-				w.cleanupQueueStates()
-				return fmt.Errorf("failed to connect to Redis: %w", err)
-			}
-			w.logger.Info("Redis connection successful")
-		}
+		// Key by PARENT queue name for shared runtime lookup
+		w.queueStates[parentQueue] = state
 	}
 
 	// Build aggregated queue weights map from all SUB-queues
@@ -170,52 +245,157 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 		}
 	}
 
+	// Update heartbeat with queue states, queues config, and transition to "running"
+	if w.heartbeat != nil {
+		w.heartbeat.updateQueueStates(w.queueStates)
+		w.heartbeat.SetStatus("running") // Set status first
+		w.heartbeat.updateQueues(w.config.Queues) // Then re-register with correct queues and status
+		w.logger.Info("Bootstrap complete, worker status: running")
+	}
+
 	w.bootstrapped = true
-	w.logger.Info("Multi-queue bootstrap completed: %d queues", len(w.queueStates))
+	w.logger.Info("Multi-queue bootstrap completed: %d parent queues", len(w.queueStates))
 	return nil
 }
 
-// bootstrapQueue handles bootstrap for a single queue.
-func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueState, error) {
+// parentQueueGroup holds information about a parent queue and which sub-queues to listen on.
+type parentQueueGroup struct {
+	parent        string   // Parent queue name (e.g., "manyQueue")
+	listenAll     bool     // If true, listen on all sub-queues from server response
+	configuredSQs []string // Specific sub-queues configured (only used if listenAll is false)
+}
+
+// groupQueuesByParent groups queue names by their parent queue.
+// Returns information about whether to listen on all sub-queues or specific ones.
+// Examples:
+//   - ["manyQueue.high", "manyQueue.low"] -> {parent: "manyQueue", listenAll: false, configuredSQs: [".high", ".low"]}
+//   - ["manyQueue"] -> {parent: "manyQueue", listenAll: true}
+//   - ["manyQueue", "manyQueue.high"] -> {parent: "manyQueue", listenAll: true} (parent overrides specific)
+func groupQueuesByParent(queueNames []string) map[string]*parentQueueGroup {
+	groups := make(map[string]*parentQueueGroup)
+	for _, name := range queueNames {
+		parent := parentQueueName(name)
+		isParentOnly := (parent == name) // No dot means parent queue itself
+
+		if _, exists := groups[parent]; !exists {
+			groups[parent] = &parentQueueGroup{
+				parent:        parent,
+				listenAll:     false,
+				configuredSQs: []string{},
+			}
+		}
+
+		if isParentOnly {
+			// Parent queue configured without sub-queue suffix → listen on all
+			groups[parent].listenAll = true
+		} else if !groups[parent].listenAll {
+			// Specific sub-queue configured (and parent not already set to listenAll)
+			groups[parent].configuredSQs = append(groups[parent].configuredSQs, name)
+		}
+	}
+	return groups
+}
+
+// parentQueueName extracts the parent queue name from a sub-queue name.
+// For example: "inference.high" -> "inference", "simple" -> "simple"
+func parentQueueName(subQueueName string) string {
+	if idx := strings.Index(subQueueName, "."); idx > 0 {
+		return subQueueName[:idx]
+	}
+	return subQueueName
+}
+
+// bootstrapQueue handles bootstrap for a single parent queue.
+// The group parameter contains the parent queue name and which sub-queues to listen on.
+// This ensures all sub-queues of the same parent share the same code deployment and runtime.
+func (w *Worker) bootstrapQueue(ctx context.Context, group *parentQueueGroup) (*QueueState, error) {
+	parentQueue := group.parent
+
 	// Create queue-specific config for bootstrap
 	queueConfig := w.config
-	queueConfig.Queue = queueName
-	// Use unique deployment dir per queue
-	queueConfig.DeploymentDir = filepath.Join(w.config.DeploymentDir, queueName)
+	queueConfig.Queue = parentQueue // Use PARENT queue for server registration
 
-	// Phase 1: Contact server for this queue
-	w.logger.Info("[%s] Contacting server...", queueName)
+	// Phase 1: Contact server for this parent queue
+	w.logger.Info("[%s] Contacting server...", parentQueue)
 	resp, err := doBootstrap(ctx, queueConfig, w.logger)
 	if err != nil {
 		return nil, fmt.Errorf("server bootstrap failed: %w", err)
 	}
 
-	// Phase 2: Deploy code for this queue
+	// Continue with code deployment and handler setup
+	return w.bootstrapQueueWithResponse(ctx, group, resp)
+}
+
+// bootstrapQueueWithResponse handles bootstrap for a queue using a pre-fetched server response.
+// This is used when we already have the server response (e.g., from early Redis credential fetch).
+func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQueueGroup, resp *BootstrapResponse) (*QueueState, error) {
+	parentQueue := group.parent
+
+	// Create queue-specific config for bootstrap
+	queueConfig := w.config
+	queueConfig.Queue = parentQueue
+	// Use PARENT queue for deployment directory (ensures deduplication across sub-queues)
+	queueConfig.DeploymentDir = filepath.Join(w.config.DeploymentDir, parentQueue)
+
+	// Deploy code for this parent queue (once, shared by all sub-queues)
 	// Pass git token from server response (resolved from vault) for authentication
 	if resp.GitToken != "" {
 		queueConfig.GitToken = resp.GitToken
 	}
-	w.logger.Info("[%s] Deploying code from %s (branch: %s)...", queueName, resp.Deployment.GitURL, resp.Deployment.Branch)
+	w.logger.Info("[%s] Deploying code from %s (branch: %s)...", parentQueue, resp.Deployment.GitURL, resp.Deployment.Branch)
 	deployment, err := deployCode(ctx, queueConfig, resp.Deployment, w.logger)
 	if err != nil {
 		return nil, fmt.Errorf("code deployment failed: %w", err)
 	}
 
 	// Determine sub-queues from response
-	subQueues := resp.SubQueues
-	if len(subQueues) == 0 {
+	allSubQueues := resp.SubQueues
+	if len(allSubQueues) == 0 {
 		// Backward compatibility: if server doesn't return sub_queues,
 		// create default sub-queue from queue config
-		subQueues = []BootstrapSubQueueConfig{{
-			Name:     queueName + ".default",
+		allSubQueues = []BootstrapSubQueueConfig{{
+			Name:     parentQueue + ".default",
 			Priority: resp.Queue.Priority,
 		}}
 	}
 
+	// Filter sub-queues based on configuration:
+	// - If listenAll is true, use all sub-queues from server
+	// - If listenAll is false, only use the specific sub-queues configured
+	var subQueuesToListen []BootstrapSubQueueConfig
+	if group.listenAll {
+		subQueuesToListen = allSubQueues
+	} else {
+		// Build a set of configured sub-queue names for fast lookup
+		configuredSet := make(map[string]bool)
+		for _, sq := range group.configuredSQs {
+			configuredSet[sq] = true
+		}
+		// Filter to only include configured sub-queues
+		for _, sq := range allSubQueues {
+			if configuredSet[sq.Name] {
+				subQueuesToListen = append(subQueuesToListen, sq)
+			}
+		}
+		// Warn if any configured sub-queues were not found in server response
+		for _, configured := range group.configuredSQs {
+			found := false
+			for _, sq := range allSubQueues {
+				if sq.Name == configured {
+					found = true
+					break
+				}
+			}
+			if !found {
+				w.logger.Warn("[%s] Configured sub-queue %q not found in server response", parentQueue, configured)
+			}
+		}
+	}
+
 	state := &QueueState{
-		Name:         queueName,
+		Name:         parentQueue,
 		Priority:     resp.Queue.Priority,
-		SubQueues:    subQueues,
+		SubQueues:    subQueuesToListen, // Only the sub-queues we're actually listening on
 		Response:     resp,
 		Deployment:   deployment,
 		Mode:         resp.Deployment.Mode,
@@ -225,15 +405,15 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 		state.Mode = "long_running"
 	}
 
-	// Phase 3: Set up handler based on mode
-	w.logger.Info("[%s] Deployment mode: %s", queueName, state.Mode)
+	// Set up handler based on mode (single runtime shared by all sub-queues)
+	w.logger.Info("[%s] Deployment mode: %s", parentQueue, state.Mode)
 
 	switch state.Mode {
 	case "one_shot":
-		// One-shot mode: spawn new process per task
-		w.logger.Info("[%s] Setting up one-shot handler...", queueName)
+		// One-shot mode: spawn new process per task (shared handler for configured sub-queues)
+		w.logger.Info("[%s] Setting up one-shot handler...", parentQueue)
 		if len(resp.Vaults) > 0 {
-			w.logger.Info("[%s] Injecting %d vault entries as environment variables", queueName, len(resp.Vaults))
+			w.logger.Info("[%s] Injecting %d vault entries as environment variables", parentQueue, len(resp.Vaults))
 		}
 		state.OneShotHandler = NewOneShotHandler(
 			deployment.CodePath, // Use CodePath (includes code_path subdirectory)
@@ -244,33 +424,33 @@ func (w *Worker) bootstrapQueue(ctx context.Context, queueName string) (*QueueSt
 			resp.Deployment.RedisStorage,
 			w.logger,
 		)
-		// Register handler for ALL sub-queues
-		for _, sq := range subQueues {
+		// Register handler only for configured sub-queues (they share the same one-shot handler)
+		for _, sq := range subQueuesToListen {
 			w.HandleQueue(sq.Name, state.OneShotHandler.ProcessTask)
 		}
 
 	default: // "long_running"
-		// Long-running mode: single supervised process
-		w.logger.Info("[%s] Starting supervised process...", queueName)
+		// Long-running mode: single supervised process shared by configured sub-queues
+		w.logger.Info("[%s] Starting supervised process...", parentQueue)
 		if len(resp.Vaults) > 0 {
-			w.logger.Info("[%s] Injecting %d vault entries as environment variables", queueName, len(resp.Vaults))
+			w.logger.Info("[%s] Injecting %d vault entries as environment variables", parentQueue, len(resp.Vaults))
 		}
 		state.Supervisor = newProcessSupervisor(deployment, resp.Deployment, resp.Vaults, w.logger)
 		if err := state.Supervisor.Start(ctx); err != nil {
 			return nil, fmt.Errorf("failed to start process: %w", err)
 		}
-		w.logger.Info("[%s] Supervised process started and ready", queueName)
+		w.logger.Info("[%s] Supervised process started and ready", parentQueue)
 
-		// Create stdio handler for communication with supervised process
+		// Create stdio handler for communication with supervised process (shared by configured sub-queues)
 		state.StdioHandler = NewStdioHandler(state.Supervisor.Stdin(), state.Supervisor.Stdout(), w.logger, resp.Deployment.RedisStorage)
 		state.StdioHandler.Start()
-		// Register handler for ALL sub-queues
-		for _, sq := range subQueues {
+		// Register handler only for configured sub-queues (they share the same stdio handler)
+		for _, sq := range subQueuesToListen {
 			w.HandleQueue(sq.Name, state.StdioHandler.ProcessTask)
 		}
 	}
 
-	w.logger.Info("[%s] Bootstrap complete with %d sub-queues (priority=%d)", queueName, len(subQueues), state.Priority)
+	w.logger.Info("[%s] Bootstrap complete with %d sub-queues (priority=%d)", parentQueue, len(subQueuesToListen), state.Priority)
 	return state, nil
 }
 
@@ -294,9 +474,16 @@ func (w *Worker) IsBootstrapped() bool {
 }
 
 // Supervisor returns the process supervisor for a specific queue.
+// Accepts either parent queue name ("manyQueue") or sub-queue name ("manyQueue.high").
 // Returns nil if queue not found or not bootstrapped.
 func (w *Worker) Supervisor(queueName string) *ProcessSupervisor {
+	// Try exact match (parent queue)
 	if state, ok := w.queueStates[queueName]; ok {
+		return state.Supervisor
+	}
+	// Try parent lookup (sub-queue name -> parent)
+	parent := parentQueueName(queueName)
+	if state, ok := w.queueStates[parent]; ok {
 		return state.Supervisor
 	}
 	return nil
@@ -308,15 +495,24 @@ func (w *Worker) QueueStates() map[string]*QueueState {
 }
 
 // IsQueueHealthy returns true if a specific queue's supervisor is healthy.
+// Accepts either parent queue name ("manyQueue") or sub-queue name ("manyQueue.high").
 func (w *Worker) IsQueueHealthy(queueName string) bool {
-	state, ok := w.queueStates[queueName]
-	if !ok {
-		return false
+	// Try exact match (parent queue)
+	if state, ok := w.queueStates[queueName]; ok {
+		if state.Supervisor == nil {
+			return true // one_shot mode, always healthy
+		}
+		return state.Supervisor.IsHealthy()
 	}
-	if state.Supervisor == nil {
-		return true // one_shot mode, always healthy
+	// Try parent lookup (sub-queue name -> parent)
+	parent := parentQueueName(queueName)
+	if state, ok := w.queueStates[parent]; ok {
+		if state.Supervisor == nil {
+			return true // one_shot mode, always healthy
+		}
+		return state.Supervisor.IsHealthy()
 	}
-	return state.Supervisor.IsHealthy()
+	return false
 }
 
 // IsAllQueuesHealthy returns true if ALL supervisors are healthy.
@@ -406,7 +602,11 @@ func (w *Worker) Run() error {
 	// Create components
 	redisClient := newRedisClient(w.rdb, w.logger)
 	w.processor = newProcessor(redisClient, w.mux, w.config)
-	w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates)
+
+	// Only create heartbeat if not already started during bootstrap
+	if w.heartbeat == nil {
+		w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates, "running")
+	}
 
 	// Set queue states for per-queue health checks
 	w.processor.SetQueueStates(w.queueStates)
@@ -416,8 +616,24 @@ func (w *Worker) Run() error {
 		w.processor.SetQueueHandler(queue, handler)
 	}
 
-	// Start components
-	w.heartbeat.start()
+	// Initialize reconnector if we have Redis config (from bootstrap)
+	if w.redisConnConfig != nil {
+		w.logger.Info("Redis reconnection enabled (addr=%s)", w.redisConnConfig.Addr)
+		w.reconnector = newRedisReconnector(*w.redisConnConfig, w.rdb, w.logger)
+		w.reconnector.SetOnReconnect(func(client *redis.Client) {
+			w.rdb = client
+			w.heartbeat.updateClient(client)
+			w.processor.updateClient(client, w.logger)
+		})
+		w.processor.SetReconnector(w.reconnector)
+	} else {
+		w.logger.Warn("Redis reconnection disabled (no connection config stored)")
+	}
+
+	// Start components (heartbeat may already be running from bootstrap)
+	if !w.heartbeat.isRunning() {
+		w.heartbeat.start()
+	}
 	w.processor.start()
 
 	w.logger.Info("Worker running. Press Ctrl+C to stop.")
@@ -464,7 +680,11 @@ func (w *Worker) Start(ctx context.Context) error {
 	// Create components
 	redisClient := newRedisClient(w.rdb, w.logger)
 	w.processor = newProcessor(redisClient, w.mux, w.config)
-	w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates)
+
+	// Only create heartbeat if not already started during bootstrap
+	if w.heartbeat == nil {
+		w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates, "running")
+	}
 
 	// Set queue states for per-queue health checks
 	w.processor.SetQueueStates(w.queueStates)
@@ -474,8 +694,24 @@ func (w *Worker) Start(ctx context.Context) error {
 		w.processor.SetQueueHandler(queue, handler)
 	}
 
-	// Start components
-	w.heartbeat.start()
+	// Initialize reconnector if we have Redis config (from bootstrap)
+	if w.redisConnConfig != nil {
+		w.logger.Info("Redis reconnection enabled (addr=%s)", w.redisConnConfig.Addr)
+		w.reconnector = newRedisReconnector(*w.redisConnConfig, w.rdb, w.logger)
+		w.reconnector.SetOnReconnect(func(client *redis.Client) {
+			w.rdb = client
+			w.heartbeat.updateClient(client)
+			w.processor.updateClient(client, w.logger)
+		})
+		w.processor.SetReconnector(w.reconnector)
+	} else {
+		w.logger.Warn("Redis reconnection disabled (no connection config stored)")
+	}
+
+	// Start components (heartbeat may already be running from bootstrap)
+	if !w.heartbeat.isRunning() {
+		w.heartbeat.start()
+	}
 	w.processor.start()
 
 	w.logger.Info("Worker running.")

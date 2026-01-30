@@ -87,7 +87,8 @@ func TestProcessSupervisorConstruction(t *testing.T) {
 	}
 
 	logger := newTestLogger()
-	supervisor := NewProcessSupervisor(deployment, spec, nil, logger)
+	vaults := map[string]string{"KEY": "value"}
+	supervisor := NewProcessSupervisor(deployment, spec, vaults, logger)
 
 	if supervisor.deployment != deployment {
 		t.Error("deployment not set correctly")
@@ -99,7 +100,7 @@ func TestProcessSupervisorConstruction(t *testing.T) {
 		t.Errorf("timeoutSec = %d, want 120", supervisor.timeoutSec)
 	}
 	if supervisor.vaultVars["KEY"] != "value" {
-		t.Error("vaultVars not set correctly")
+		t.Errorf("vaultVars[KEY] = %q, want %q", supervisor.vaultVars["KEY"], "value")
 	}
 	if supervisor.healthy {
 		t.Error("supervisor should not be healthy initially")
