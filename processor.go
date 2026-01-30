@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -85,14 +84,7 @@ func buildQueueList(queueWeights map[string]int) []string {
 	return result
 }
 
-// parentQueueName extracts the parent queue name from a sub-queue name.
-// For example: "inference.high" -> "inference", "simple" -> "simple"
-func parentQueueName(subQueueName string) string {
-	if idx := strings.Index(subQueueName, "."); idx > 0 {
-		return subQueueName[:idx]
-	}
-	return subQueueName
-}
+// Note: parentQueueName is defined in worker.go and shared by both files.
 
 // start begins processing tasks with the configured concurrency.
 func (p *processor) start() {
