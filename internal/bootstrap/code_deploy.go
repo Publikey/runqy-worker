@@ -268,7 +268,24 @@ func createVirtualEnv(ctx context.Context, repoPath, venvPath string, logger Log
 		return venvPython, nil
 	}
 
-	// Find python executable
+	// Try uv first (faster, doesn't require ensurepip)
+	if uvCmd := findUV(); uvCmd != "" {
+		logger.Info("Creating virtualenv at %s using uv", venvPath)
+		cmd := exec.CommandContext(ctx, uvCmd, "venv", venvPath)
+		cmd.Dir = repoPath
+		if output, err := cmd.CombinedOutput(); err == nil {
+			// Verify the python executable exists
+			if _, err := os.Stat(venvPython); err == nil {
+				logger.Info("Virtualenv created successfully with uv")
+				return venvPython, nil
+			}
+			logger.Warn("uv venv succeeded but python not found at %s", venvPython)
+		} else {
+			logger.Warn("uv venv failed, falling back to python -m venv: %s", string(output))
+		}
+	}
+
+	// Fallback to python -m venv
 	pythonCmd := FindPython()
 	if pythonCmd == "" {
 		return "", fmt.Errorf("python not found in PATH")
@@ -291,6 +308,14 @@ func createVirtualEnv(ctx context.Context, repoPath, venvPath string, logger Log
 
 	logger.Info("Virtualenv created successfully")
 	return venvPython, nil
+}
+
+// findUV finds the uv executable in PATH.
+func findUV() string {
+	if path, err := exec.LookPath("uv"); err == nil {
+		return path
+	}
+	return ""
 }
 
 // FindPython finds a Python 3 executable in PATH.
