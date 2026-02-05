@@ -271,7 +271,8 @@ func createVirtualEnv(ctx context.Context, repoPath, venvPath string, logger Log
 	// Try uv first (faster, doesn't require ensurepip)
 	if uvCmd := findUV(); uvCmd != "" {
 		logger.Info("Creating virtualenv at %s using uv", venvPath)
-		cmd := exec.CommandContext(ctx, uvCmd, "venv", venvPath)
+		// Use --seed to include pip in the venv (required for pip install later)
+		cmd := exec.CommandContext(ctx, uvCmd, "venv", "--seed", venvPath)
 		cmd.Dir = repoPath
 		if output, err := cmd.CombinedOutput(); err == nil {
 			// Verify the python executable exists
