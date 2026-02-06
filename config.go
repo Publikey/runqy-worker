@@ -23,7 +23,8 @@ type Config struct {
 	GitToken  string // Optional: Personal access token or password
 
 	// Deployment
-	DeploymentDir string // Directory for code deployment (default: "./deployment")
+	DeploymentDir         string // Directory for code deployment (default: "./deployment")
+	UseSystemSitePackages bool   // Use --system-site-packages for venv (default: true)
 
 	// Redis connection settings (populated by bootstrap, not required in config)
 	RedisAddr     string
@@ -57,6 +58,9 @@ func DefaultConfig() Config {
 		BootstrapRetries:    3,
 		BootstrapRetryDelay: 5 * time.Second,
 		DeploymentDir:       "./deployment",
+
+		// Deployment defaults
+		UseSystemSitePackages: true, // Default: inherit system packages (e.g., PyTorch)
 
 		// Redis defaults (will be overwritten by bootstrap)
 		RedisAddr: "localhost:6379",
