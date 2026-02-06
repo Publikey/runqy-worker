@@ -22,15 +22,16 @@ type Logger interface {
 
 // Config holds the configuration needed for bootstrap operations.
 type Config struct {
-	ServerURL           string
-	APIKey              string
-	Queue               string
-	Version             string
-	BootstrapRetries    int
-	BootstrapRetryDelay time.Duration
-	DeploymentDir       string
-	GitSSHKey           string
-	GitToken            string
+	ServerURL             string
+	APIKey                string
+	Queue                 string
+	Version               string
+	BootstrapRetries      int
+	BootstrapRetryDelay   time.Duration
+	DeploymentDir         string
+	GitSSHKey             string
+	GitToken              string
+	UseSystemSitePackages bool // Use --system-site-packages for venv (default: true)
 }
 
 // Response contains the configuration received from runqy-server.

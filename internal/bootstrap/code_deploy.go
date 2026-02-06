@@ -55,7 +55,7 @@ func DeployCode(ctx context.Context, config Config, spec DeploymentConfig, logge
 
 	// Phase 3: Create virtual environment (in code path)
 	venvPath := filepath.Join(codePath, ".venv")
-	venvPython, err := createVirtualEnv(ctx, codePath, venvPath, logger)
+	venvPython, err := createVirtualEnv(ctx, codePath, venvPath, config.UseSystemSitePackages, logger)
 	if err != nil {
 		return nil, fmt.Errorf("virtualenv creation failed: %w", err)
 	}
@@ -253,7 +253,7 @@ func detectPackageManager(repoPath string, logger Logger) packageManager {
 }
 
 // createVirtualEnv creates a Python virtual environment if it doesn't exist.
-func createVirtualEnv(ctx context.Context, repoPath, venvPath string, logger Logger) (string, error) {
+func createVirtualEnv(ctx context.Context, repoPath, venvPath string, useSystemSitePackages bool, logger Logger) (string, error) {
 	// Determine python executable path based on OS
 	var venvPython string
 	if runtime.GOOS == "windows" {
@@ -270,9 +270,15 @@ func createVirtualEnv(ctx context.Context, repoPath, venvPath string, logger Log
 
 	// Try uv first (faster, doesn't require ensurepip)
 	if uvCmd := findUV(); uvCmd != "" {
-		logger.Info("Creating virtualenv at %s using uv", venvPath)
-		// Use --seed to include pip in the venv (required for pip install later)
-		cmd := exec.CommandContext(ctx, uvCmd, "venv", "--seed", venvPath)
+		var args []string
+		if useSystemSitePackages {
+			args = []string{"venv", "--seed", "--system-site-packages", venvPath}
+			logger.Info("Creating virtualenv at %s using uv (with system-site-packages)", venvPath)
+		} else {
+			args = []string{"venv", "--seed", venvPath}
+			logger.Info("Creating virtualenv at %s using uv (isolated)", venvPath)
+		}
+		cmd := exec.CommandContext(ctx, uvCmd, args...)
 		cmd.Dir = repoPath
 		if output, err := cmd.CombinedOutput(); err == nil {
 			// Verify the python executable exists
@@ -292,9 +298,14 @@ func createVirtualEnv(ctx context.Context, repoPath, venvPath string, logger Log
 		return "", fmt.Errorf("python not found in PATH")
 	}
 
-	logger.Info("Creating virtualenv at %s using %s", venvPath, pythonCmd)
-
-	cmd := exec.CommandContext(ctx, pythonCmd, "-m", "venv", venvPath)
+	var cmd *exec.Cmd
+	if useSystemSitePackages {
+		logger.Info("Creating virtualenv at %s using %s (with system-site-packages)", venvPath, pythonCmd)
+		cmd = exec.CommandContext(ctx, pythonCmd, "-m", "venv", "--system-site-packages", venvPath)
+	} else {
+		logger.Info("Creating virtualenv at %s using %s (isolated)", venvPath, pythonCmd)
+		cmd = exec.CommandContext(ctx, pythonCmd, "-m", "venv", venvPath)
+	}
 	cmd.Dir = repoPath
 
 	output, err := cmd.CombinedOutput()
@@ -357,6 +368,9 @@ func installDependencies(ctx context.Context, repoPath, venvPython string, pkgMg
 }
 
 // installWithPip installs dependencies using pip.
+// Note: We use pip instead of uv for installation because uv doesn't properly
+// respect system-site-packages when checking for already-installed packages.
+// This is important for Docker images with pre-installed packages (e.g., PyTorch).
 func installWithPip(ctx context.Context, repoPath, venvPython string, logger Logger) error {
 	requirementsPath := filepath.Join(repoPath, "requirements.txt")
 

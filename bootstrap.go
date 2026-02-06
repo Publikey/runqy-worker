@@ -52,15 +52,16 @@ func doBootstrap(ctx context.Context, config Config, logger Logger) (*BootstrapR
 func deployCode(ctx context.Context, config Config, spec BootstrapDeploymentConfig, logger Logger) (*DeploymentResult, error) {
 	// Convert Config to bootstrap.Config
 	bsCfg := internalbootstrap.Config{
-		ServerURL:           config.ServerURL,
-		APIKey:              config.APIKey,
-		Queue:               config.Queue,
-		Version:             config.Version,
-		BootstrapRetries:    config.BootstrapRetries,
-		BootstrapRetryDelay: config.BootstrapRetryDelay,
-		DeploymentDir:       config.DeploymentDir,
-		GitSSHKey:           config.GitSSHKey,
-		GitToken:            config.GitToken,
+		ServerURL:             config.ServerURL,
+		APIKey:                config.APIKey,
+		Queue:                 config.Queue,
+		Version:               config.Version,
+		BootstrapRetries:      config.BootstrapRetries,
+		BootstrapRetryDelay:   config.BootstrapRetryDelay,
+		DeploymentDir:         config.DeploymentDir,
+		GitSSHKey:             config.GitSSHKey,
+		GitToken:              config.GitToken,
+		UseSystemSitePackages: config.UseSystemSitePackages,
 	}
 
 	return internalbootstrap.DeployCode(ctx, bsCfg, spec, &loggerAdapter{logger})

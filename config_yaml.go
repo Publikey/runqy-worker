@@ -41,7 +41,8 @@ type GitConfig struct {
 
 // DeploymentYAML holds deployment directory settings.
 type DeploymentYAML struct {
-	Dir string `yaml:"dir"` // Directory for code deployment (default: "./deployment")
+	Dir                   string `yaml:"dir"`                               // Directory for code deployment (default: "./deployment")
+	UseSystemSitePackages *bool  `yaml:"use_system_site_packages,omitempty"` // Use --system-site-packages for venv (default: true)
 }
 
 // DefaultsConfig provides default values for handlers.
@@ -185,6 +186,9 @@ func loadConfigFromEnv() Config {
 	if dir := os.Getenv("RUNQY_DEPLOYMENT_DIR"); dir != "" {
 		cfg.DeploymentDir = dir
 	}
+	if useSysSite := os.Getenv("RUNQY_USE_SYSTEM_SITE_PACKAGES"); useSysSite != "" {
+		cfg.UseSystemSitePackages = strings.ToLower(useSysSite) == "true" || useSysSite == "1"
+	}
 
 	// Retry settings
 	if maxRetry := os.Getenv("RUNQY_MAX_RETRY"); maxRetry != "" {
@@ -263,6 +267,10 @@ func toWorkerConfig(yc *YAMLConfig) Config {
 	// Deployment settings
 	if yc.Deployment.Dir != "" {
 		cfg.DeploymentDir = yc.Deployment.Dir
+	}
+	// use_system_site_packages (default true if not specified)
+	if yc.Deployment.UseSystemSitePackages != nil {
+		cfg.UseSystemSitePackages = *yc.Deployment.UseSystemSitePackages
 	}
 
 	// Retry settings
