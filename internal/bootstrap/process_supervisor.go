@@ -29,6 +29,8 @@ type ProcessSupervisor struct {
 	stdout       io.ReadCloser
 	stdoutReader *bufio.Reader // Buffered reader for stdout (preserves buffered data)
 
+	logBuffer LogAppender // optional log buffer for capturing stderr/stdout
+
 	mu        sync.RWMutex
 	healthy   bool
 	crashed   bool
@@ -193,6 +195,11 @@ func (s *ProcessSupervisor) waitForReady(ctx context.Context, timeout time.Durat
 	}
 }
 
+// SetLogBuffer sets the log buffer for capturing stderr and stdout output.
+func (s *ProcessSupervisor) SetLogBuffer(buf LogAppender) {
+	s.logBuffer = buf
+}
+
 // streamStderr reads stderr and logs output.
 func (s *ProcessSupervisor) streamStderr(stderr io.ReadCloser) {
 	scanner := bufio.NewScanner(stderr)
@@ -202,6 +209,9 @@ func (s *ProcessSupervisor) streamStderr(stderr io.ReadCloser) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		s.logger.Info("[STDERR] %s", line)
+		if s.logBuffer != nil {
+			s.logBuffer.Append("stderr", line)
+		}
 	}
 
 	if err := scanner.Err(); err != nil {

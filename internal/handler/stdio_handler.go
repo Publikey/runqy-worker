@@ -36,6 +36,7 @@ type StdioHandler struct {
 	logger  Logger
 
 	redisStorage bool
+	logBuffer    LogAppender // optional log buffer for non-JSON stdout
 
 	// For graceful shutdown
 	done   chan struct{}
@@ -55,6 +56,11 @@ func NewStdioHandler(stdin io.Writer, stdout io.Reader, logger Logger, redisStor
 		redisStorage: redisStorage,
 		done:         make(chan struct{}),
 	}
+}
+
+// SetLogBuffer sets the log buffer for capturing non-JSON stdout lines.
+func (h *StdioHandler) SetLogBuffer(buf LogAppender) {
+	h.logBuffer = buf
 }
 
 // Start begins reading responses from stdout in a background goroutine.
@@ -207,6 +213,9 @@ func (h *StdioHandler) readResponses() {
 		// Skip status messages (used for startup detection)
 		if resp.TaskID == "" {
 			h.logger.Debug("Received status message: %s", string(line))
+			if h.logBuffer != nil {
+				h.logBuffer.Append("stdout", string(line))
+			}
 			continue
 		}
 

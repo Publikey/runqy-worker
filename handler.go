@@ -104,6 +104,11 @@ func NewStdioHandler(stdin io.Writer, stdout io.Reader, logger Logger, redisStor
 	}
 }
 
+// SetLogBuffer sets the log buffer for capturing non-JSON stdout lines.
+func (h *StdioHandler) SetLogBuffer(buf *LogBuffer) {
+	h.internal.SetLogBuffer(buf)
+}
+
 // Start begins reading responses from stdout in a background goroutine.
 func (h *StdioHandler) Start() {
 	h.internal.Start()

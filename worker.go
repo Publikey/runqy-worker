@@ -43,6 +43,7 @@ type Worker struct {
 	// Multi-queue bootstrap state
 	queueStates  map[string]*QueueState
 	bootstrapped bool
+	logBuffer    *LogBuffer // shared log buffer for all queues
 
 	// Redis connection config (stored during bootstrap for reconnection)
 	redisConnConfig *RedisConnConfig
@@ -140,6 +141,7 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 	}
 
 	w.queueStates = make(map[string]*QueueState)
+	w.logBuffer = NewLogBuffer(500)
 
 	// Group configured queues by parent to share deployment and runtime
 	parentGroups := groupQueuesByParent(w.config.QueueNames)
@@ -203,6 +205,7 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 	// Start early heartbeat with "bootstrapping" status
 	// This makes the worker visible in Redis while deploying code
 	w.heartbeat = newHeartbeat(w.rdb, w.config, nil, "bootstrapping")
+	w.heartbeat.setLogBuffer(w.logBuffer)
 	w.heartbeat.start()
 	w.logger.Info("Worker registered as bootstrapping")
 
@@ -436,6 +439,9 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 			w.logger.Info("[%s] Injecting %d vault entries as environment variables", parentQueue, len(resp.Vaults))
 		}
 		state.Supervisor = newProcessSupervisor(deployment, resp.Deployment, resp.Vaults, w.logger)
+		if w.logBuffer != nil {
+			state.Supervisor.SetLogBuffer(w.logBuffer)
+		}
 		if err := state.Supervisor.Start(ctx); err != nil {
 			return nil, fmt.Errorf("failed to start process: %w", err)
 		}
@@ -443,6 +449,9 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 
 		// Create stdio handler for communication with supervised process (shared by configured sub-queues)
 		state.StdioHandler = NewStdioHandler(state.Supervisor.Stdin(), state.Supervisor.Stdout(), w.logger, resp.Deployment.RedisStorage)
+		if w.logBuffer != nil {
+			state.StdioHandler.SetLogBuffer(w.logBuffer)
+		}
 		state.StdioHandler.Start()
 		// Register handler only for configured sub-queues (they share the same stdio handler)
 		for _, sq := range subQueuesToListen {
