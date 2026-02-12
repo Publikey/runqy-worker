@@ -14,6 +14,11 @@ type Logger interface {
 	Debug(format string, args ...interface{})
 }
 
+// LogAppender receives captured log lines from child processes.
+type LogAppender interface {
+	Append(source, text string)
+}
+
 // Task interface defines what handlers need from a task.
 type Task interface {
 	ID() string

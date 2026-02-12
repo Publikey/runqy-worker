@@ -20,6 +20,11 @@ type Logger interface {
 	Debug(format string, args ...interface{})
 }
 
+// LogAppender receives captured log lines from child processes.
+type LogAppender interface {
+	Append(source, text string)
+}
+
 // Config holds the configuration needed for bootstrap operations.
 type Config struct {
 	ServerURL             string

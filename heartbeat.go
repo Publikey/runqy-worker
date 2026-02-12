@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sync"
@@ -24,6 +25,9 @@ type heartbeat struct {
 	status      string                 // current status ("bootstrapping" or "running")
 	statusMu    sync.RWMutex           // protects status field
 	started     bool                   // whether heartbeat loop has been started
+
+	logBuffer  *LogBuffer // log buffer for streaming logs to Redis
+	lastLogSeq uint64     // last flushed log sequence number
 }
 
 // newHeartbeat creates a new heartbeat sender.
@@ -157,6 +161,14 @@ func (h *heartbeat) register(ctx context.Context) {
 		"status":      h.getStatus(),
 		"healthy":     h.isHealthy(),
 	}
+
+	// Attach system metrics
+	if m, err := collectMetrics(); err == nil {
+		if b, err := json.Marshal(m); err == nil {
+			data["metrics"] = string(b)
+		}
+	}
+
 	if err := rdb.HSet(ctx, workerKey, data).Err(); err != nil {
 		h.logger.Error("Failed to set worker data: %v", err)
 	}
@@ -177,13 +189,25 @@ func (h *heartbeat) beat(ctx context.Context) {
 	now := time.Now().Unix()
 	healthy := h.isHealthy()
 
-	if err := rdb.HSet(ctx, workerKey, map[string]interface{}{
+	beatData := map[string]interface{}{
 		"last_beat": now,
 		"status":    h.getStatus(),
 		"healthy":   healthy,
-	}).Err(); err != nil {
+	}
+
+	// Attach system metrics
+	if m, err := collectMetrics(); err == nil {
+		if b, err := json.Marshal(m); err == nil {
+			beatData["metrics"] = string(b)
+		}
+	}
+
+	if err := rdb.HSet(ctx, workerKey, beatData).Err(); err != nil {
 		h.logger.Error("Heartbeat HSet failed: %v", err)
 	}
+
+	// Flush logs to Redis
+	h.flushLogs(ctx, rdb)
 	if err := rdb.Expire(ctx, workerKey, 30*time.Second).Err(); err != nil {
 		h.logger.Error("Heartbeat Expire failed: %v", err)
 	}
@@ -206,6 +230,39 @@ func (h *heartbeat) isHealthy() bool {
 		}
 	}
 	return true
+}
+
+// setLogBuffer sets the log buffer for log streaming to Redis.
+func (h *heartbeat) setLogBuffer(buf *LogBuffer) {
+	h.logBuffer = buf
+}
+
+// flushLogs pushes new log lines to a Redis list.
+func (h *heartbeat) flushLogs(ctx context.Context, rdb *redis.Client) {
+	if h.logBuffer == nil {
+		return
+	}
+
+	lines := h.logBuffer.LinesSince(h.lastLogSeq)
+	if len(lines) == 0 {
+		return
+	}
+	h.lastLogSeq = lines[len(lines)-1].Seq
+
+	logKey := fmt.Sprintf("asynq:workers:%s:logs", h.workerID)
+	pipe := rdb.Pipeline()
+	for _, line := range lines {
+		b, err := json.Marshal(line)
+		if err != nil {
+			continue
+		}
+		pipe.RPush(ctx, logKey, string(b))
+	}
+	pipe.LTrim(ctx, logKey, -500, -1)
+	pipe.Expire(ctx, logKey, 30*time.Second)
+	if _, err := pipe.Exec(ctx); err != nil {
+		h.logger.Error("Failed to flush logs: %v", err)
+	}
 }
 
 // deregister removes the worker from the registry.
