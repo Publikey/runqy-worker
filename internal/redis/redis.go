@@ -360,6 +360,16 @@ func (r *Client) Complete(ctx context.Context, taskID string, queueName string) 
 	r.Rdb.LRem(ctx, activeKey, 1, taskID)
 	r.Rdb.ZRem(ctx, leaseKey, taskID)
 
+	// Update the protobuf msg field with completed_at timestamp (for asynq inspector compatibility).
+	// Append field 13 (completed_at, varint) to the existing protobuf blob.
+	// Protobuf allows appending fields — the last value for a scalar field wins.
+	if msgData, err := r.Rdb.HGet(ctx, taskKey, FieldMsg).Result(); err == nil {
+		var extra []byte
+		extra = append(extra, (13<<3)|0) // field 13, wire type 0 (varint)
+		extra = appendVarint(extra, uint64(now))
+		r.Rdb.HSet(ctx, taskKey, FieldMsg, string(append([]byte(msgData), extra...)))
+	}
+
 	// Update task hash: state and completed_at
 	r.Rdb.HSet(ctx, taskKey,
 		FieldState, StateCompleted,
