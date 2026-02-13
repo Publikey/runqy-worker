@@ -79,11 +79,11 @@ func (h *OneShotHandler) ProcessTask(ctx context.Context, task Task) error {
 		h.logger.Debug("OneShot: using venv python: %s", args[0])
 	}
 
-	// Create process with timeout context
-	procCtx, cancel := context.WithTimeout(ctx, h.timeout)
-	defer cancel()
+	// Create startup timeout context (for ready signal only)
+	startupCtx, startupCancel := context.WithTimeout(ctx, h.timeout)
+	defer startupCancel()
 
-	cmd := exec.CommandContext(procCtx, args[0], args[1:]...)
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Dir = h.repoPath
 	cmd.Env = h.buildEnvironment()
 
@@ -117,7 +117,7 @@ func (h *OneShotHandler) ProcessTask(ctx context.Context, task Task) error {
 	stdoutReader := bufio.NewReaderSize(stdout, 64*1024)
 
 	// Wait for ready signal
-	if err := h.waitForReady(procCtx, stdoutReader, taskID); err != nil {
+	if err := h.waitForReady(startupCtx, stdoutReader, taskID); err != nil {
 		cmd.Process.Kill()
 		return fmt.Errorf("failed to get ready signal: %w", err)
 	}
@@ -153,7 +153,7 @@ func (h *OneShotHandler) ProcessTask(ctx context.Context, task Task) error {
 	stdin.Close() // Signal EOF to process
 
 	// Read response
-	resp, err := h.readResponse(procCtx, stdoutReader, taskID)
+	resp, err := h.readResponse(ctx, stdoutReader, taskID)
 	if err != nil {
 		cmd.Process.Kill()
 		return err
