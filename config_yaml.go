@@ -13,12 +13,23 @@ import (
 
 // YAMLConfig represents the YAML configuration file structure.
 type YAMLConfig struct {
-	Server     ServerConfig   `yaml:"server"`
-	Worker     WorkerConfig   `yaml:"worker"`
-	Bootstrap  BootstrapConfig `yaml:"bootstrap"`
-	Git        GitConfig      `yaml:"git"`
-	Deployment DeploymentYAML `yaml:"deployment"`
-	Retry      RetryConfig    `yaml:"retry"`
+	Server     ServerConfig     `yaml:"server"`
+	Worker     WorkerConfig     `yaml:"worker"`
+	Bootstrap  BootstrapConfig  `yaml:"bootstrap"`
+	Git        GitConfig        `yaml:"git"`
+	Deployment DeploymentYAML   `yaml:"deployment"`
+	Retry      RetryConfig      `yaml:"retry"`
+	Recovery   RecoveryYAMLConfig `yaml:"recovery"`
+}
+
+// RecoveryYAMLConfig holds recovery settings from YAML.
+type RecoveryYAMLConfig struct {
+	Enabled        *bool   `yaml:"enabled,omitempty"`
+	MaxRestarts    int     `yaml:"max_restarts"`
+	InitialDelay   string  `yaml:"initial_delay"`
+	MaxDelay       string  `yaml:"max_delay"`
+	BackoffFactor  float64 `yaml:"backoff_factor"`
+	CooldownPeriod string  `yaml:"cooldown_period"`
 }
 
 // ServerConfig holds runqy-server connection settings.
@@ -197,6 +208,31 @@ func loadConfigFromEnv() Config {
 		}
 	}
 
+	// Recovery settings
+	if enabled := os.Getenv("RUNQY_RECOVERY_ENABLED"); enabled != "" {
+		cfg.Recovery.Enabled = strings.ToLower(enabled) == "true" || enabled == "1"
+	}
+	if maxRestarts := os.Getenv("RUNQY_RECOVERY_MAX_RESTARTS"); maxRestarts != "" {
+		if n, err := strconv.Atoi(maxRestarts); err == nil && n > 0 {
+			cfg.Recovery.MaxRestarts = n
+		}
+	}
+	if initialDelay := os.Getenv("RUNQY_RECOVERY_INITIAL_DELAY"); initialDelay != "" {
+		if d, err := time.ParseDuration(initialDelay); err == nil {
+			cfg.Recovery.InitialDelay = d
+		}
+	}
+	if maxDelay := os.Getenv("RUNQY_RECOVERY_MAX_DELAY"); maxDelay != "" {
+		if d, err := time.ParseDuration(maxDelay); err == nil {
+			cfg.Recovery.MaxDelay = d
+		}
+	}
+	if cooldown := os.Getenv("RUNQY_RECOVERY_COOLDOWN"); cooldown != "" {
+		if d, err := time.ParseDuration(cooldown); err == nil {
+			cfg.Recovery.CooldownPeriod = d
+		}
+	}
+
 	return cfg
 }
 
@@ -276,6 +312,32 @@ func toWorkerConfig(yc *YAMLConfig) Config {
 	// Retry settings
 	if yc.Retry.MaxRetry > 0 {
 		cfg.MaxRetry = yc.Retry.MaxRetry
+	}
+
+	// Recovery settings
+	if yc.Recovery.Enabled != nil {
+		cfg.Recovery.Enabled = *yc.Recovery.Enabled
+	}
+	if yc.Recovery.MaxRestarts > 0 {
+		cfg.Recovery.MaxRestarts = yc.Recovery.MaxRestarts
+	}
+	if yc.Recovery.InitialDelay != "" {
+		if d, err := time.ParseDuration(yc.Recovery.InitialDelay); err == nil {
+			cfg.Recovery.InitialDelay = d
+		}
+	}
+	if yc.Recovery.MaxDelay != "" {
+		if d, err := time.ParseDuration(yc.Recovery.MaxDelay); err == nil {
+			cfg.Recovery.MaxDelay = d
+		}
+	}
+	if yc.Recovery.BackoffFactor > 0 {
+		cfg.Recovery.BackoffFactor = yc.Recovery.BackoffFactor
+	}
+	if yc.Recovery.CooldownPeriod != "" {
+		if d, err := time.ParseDuration(yc.Recovery.CooldownPeriod); err == nil {
+			cfg.Recovery.CooldownPeriod = d
+		}
 	}
 
 	return cfg

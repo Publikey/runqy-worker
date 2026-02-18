@@ -162,7 +162,18 @@ func (p *processor) processOne(ctx context.Context) {
 	// Check if parent queue's supervisor is healthy
 	if state, ok := p.queueStates[parentQueue]; ok {
 		if state.Supervisor != nil && !state.Supervisor.IsHealthy() {
-			p.logger.Error("Queue %s is in degraded state - supervised process has crashed", parentQueue)
+			if state.Recovery != nil {
+				switch state.Recovery.State() {
+				case recoveryRecovering:
+					p.logger.Info("Queue %s recovering — restart attempt in progress, task will retry", parentQueue)
+				case recoveryDegraded:
+					p.logger.Error("Queue %s in degraded state — all recovery attempts exhausted, manual restart required", parentQueue)
+				default:
+					p.logger.Error("Queue %s is unhealthy — supervised process has crashed", parentQueue)
+				}
+			} else {
+				p.logger.Error("Queue %s is in degraded state — supervised process has crashed (no auto-recovery)", parentQueue)
+			}
 			// Fail the task so it can be retried later
 			p.handleError(ctx, task, queueName, fmt.Errorf("queue %s supervisor crashed", parentQueue))
 			return

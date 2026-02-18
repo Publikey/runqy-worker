@@ -202,6 +202,25 @@ func (h *heartbeat) beat(ctx context.Context) {
 		}
 	}
 
+	// Add recovery state info per queue
+	if h.queueStates != nil {
+		recoveryInfo := make(map[string]interface{})
+		for name, state := range h.queueStates {
+			if state.Recovery != nil {
+				recoveryInfo[name] = map[string]interface{}{
+					"state":             string(state.Recovery.State()),
+					"consecutive_fails": state.Recovery.ConsecutiveFails(),
+					"total_restarts":    state.Recovery.TotalRestarts(),
+				}
+			}
+		}
+		if len(recoveryInfo) > 0 {
+			if b, err := json.Marshal(recoveryInfo); err == nil {
+				beatData["recovery"] = string(b)
+			}
+		}
+	}
+
 	if err := rdb.HSet(ctx, workerKey, beatData).Err(); err != nil {
 		h.logger.Error("Heartbeat HSet failed: %v", err)
 	}

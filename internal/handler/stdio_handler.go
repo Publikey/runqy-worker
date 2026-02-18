@@ -189,6 +189,31 @@ func (h *StdioHandler) handleResponse(resp *StdioTaskResponse, task Task) error 
 	return nil
 }
 
+// Reconnect swaps the stdin/stdout pipes after a process restart.
+// It waits for the old readResponses goroutine to finish, fails all pending tasks,
+// then starts a new readResponses goroutine with the new pipes.
+func (h *StdioHandler) Reconnect(stdin io.Writer, stdout io.Reader) {
+	// Wait for old readResponses to finish (it exits when stdout closes)
+	h.wg.Wait()
+
+	// Fail all pending tasks
+	h.mu.Lock()
+	for taskID, ch := range h.pending {
+		close(ch)
+		delete(h.pending, taskID)
+	}
+	// Swap pipes and reset state
+	h.stdin = stdin
+	h.stdout = stdout
+	h.closed = false
+	h.done = make(chan struct{})
+	h.mu.Unlock()
+
+	// Start new readResponses goroutine
+	h.wg.Add(1)
+	go h.readResponses()
+}
+
 // readResponses reads JSON lines from stdout and dispatches to pending tasks.
 func (h *StdioHandler) readResponses() {
 	defer h.wg.Done()

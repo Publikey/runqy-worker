@@ -37,6 +37,9 @@ type ProcessSupervisor struct {
 	crashedAt time.Time
 	exitCode  int
 
+	restartCount int
+	lastRestart  time.Time
+
 	done   chan struct{}
 	cancel context.CancelFunc
 }
@@ -356,6 +359,72 @@ func (s *ProcessSupervisor) Stop() error {
 // Done returns a channel that's closed when the process exits.
 func (s *ProcessSupervisor) Done() <-chan struct{} {
 	return s.done
+}
+
+// Restart stops the current process (if running), resets internal state,
+// and starts a new process. Returns an error if the new process fails to start.
+func (s *ProcessSupervisor) Restart(ctx context.Context) error {
+	s.logger.Info("Restarting supervised process...")
+
+	// Stop the existing process if it hasn't exited yet
+	select {
+	case <-s.done:
+		// Process already exited, no need to stop
+		s.logger.Debug("Process already exited, skipping stop")
+	default:
+		if err := s.Stop(); err != nil {
+			s.logger.Warn("Error stopping process during restart: %v", err)
+		}
+		// Wait for done to be closed by monitorProcess
+		<-s.done
+	}
+
+	// Reset internal state
+	s.mu.Lock()
+	s.healthy = false
+	s.crashed = false
+	s.crashedAt = time.Time{}
+	s.exitCode = 0
+	s.cmd = nil
+	s.stdin = nil
+	s.stdout = nil
+	s.stdoutReader = nil
+	s.cancel = nil
+	s.done = make(chan struct{})
+	s.mu.Unlock()
+
+	// Start the new process
+	if err := s.Start(ctx); err != nil {
+		return fmt.Errorf("restart failed: %w", err)
+	}
+
+	// Update restart tracking
+	s.mu.Lock()
+	s.restartCount++
+	s.lastRestart = time.Now()
+	s.mu.Unlock()
+
+	s.logger.Info("Process restarted successfully (total restarts: %d)", s.restartCount)
+	return nil
+}
+
+// RestartCount returns the number of times the process has been restarted.
+func (s *ProcessSupervisor) RestartCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.restartCount
+}
+
+// LastRestart returns the time of the last restart.
+func (s *ProcessSupervisor) LastRestart() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastRestart
+}
+
+// TimeoutSec returns the startup timeout in seconds.
+func (s *ProcessSupervisor) TimeoutSec() int {
+	return s.timeoutSec
 }
 
 // ParseCommand splits a command string into executable and arguments.
