@@ -67,12 +67,24 @@ func (r *redisClient) complete(ctx context.Context, task *Task, queueName string
 
 // retry re-queues a task for retry.
 func (r *redisClient) retry(ctx context.Context, task *Task, queueName string, delay time.Duration) error {
-	return r.internal.Retry(ctx, task.id, queueName, delay)
+	return r.internal.Retry(ctx, &redis.TaskData{
+		ID:       task.id,
+		Type:     task.typename,
+		Queue:    task.queue,
+		MaxRetry: task.maxRetry,
+		Retry:    task.retry,
+	}, queueName, delay)
 }
 
 // fail marks a task as permanently failed.
 func (r *redisClient) fail(ctx context.Context, task *Task, queueName string, errMsg string) error {
-	return r.internal.Fail(ctx, task.id, queueName, errMsg)
+	return r.internal.Fail(ctx, &redis.TaskData{
+		ID:       task.id,
+		Type:     task.typename,
+		Queue:    task.queue,
+		MaxRetry: task.maxRetry,
+		Retry:    task.retry,
+	}, queueName, errMsg)
 }
 
 // ping checks Redis connectivity.
