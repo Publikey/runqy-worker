@@ -21,11 +21,12 @@ type processor struct {
 	subQueueToState  map[string]*QueueState // sub-queue name -> parent queue state
 	reconnector      *redisReconnector      // for connection recovery
 
-	done   chan struct{}
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	logger Logger
+	done      chan struct{}
+	stopping  chan struct{} // closed to signal "stop dequeuing" (graceful drain)
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	logger    Logger
 }
 
 // newProcessor creates a new processor.
@@ -40,6 +41,7 @@ func newProcessor(rdb *redisClient, handler Handler, cfg Config) *processor {
 		config:        cfg,
 		queues:        queues,
 		done:          make(chan struct{}),
+		stopping:      make(chan struct{}),
 		logger:        cfg.Logger,
 	}
 }
@@ -96,9 +98,33 @@ func (p *processor) start() {
 }
 
 // stop gracefully stops all workers.
+// First stops dequeuing, then waits for in-flight tasks up to shutdown_timeout,
+// then cancels any remaining tasks.
 func (p *processor) stop() {
-	p.cancel()
-	p.wg.Wait()
+	// Phase 1: Signal workers to stop dequeuing new tasks
+	close(p.stopping)
+
+	// Phase 2: Wait for in-flight tasks to finish (up to shutdown_timeout)
+	timeout := p.config.ShutdownTimeout
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// All workers finished gracefully
+	case <-time.After(timeout):
+		// Phase 3: Force cancel remaining tasks
+		p.logger.Warn("Shutdown timeout reached, cancelling remaining tasks")
+		p.cancel()
+		p.wg.Wait()
+	}
 }
 
 // worker is a single worker goroutine.
@@ -107,6 +133,14 @@ func (p *processor) worker(id int) {
 
 	p.logger.Info(fmt.Sprintf("Worker %d started", id))
 	for {
+		// Check if we should stop dequeuing (graceful drain)
+		select {
+		case <-p.stopping:
+			p.logger.Info(fmt.Sprintf("Worker %d stopping (graceful drain)", id))
+			return
+		default:
+		}
+
 		p.processOne(p.ctx)
 		if p.ctx.Err() != nil {
 			p.logger.Info(fmt.Sprintf("Worker %d stopping", id))
@@ -198,6 +232,23 @@ func (p *processor) processOne(ctx context.Context) {
 	}
 }
 
+// redisRetry retries an operation up to 3 times with backoff.
+func (p *processor) redisRetry(operation string, taskID string, fn func() error) error {
+	delays := []time.Duration{100 * time.Millisecond, 500 * time.Millisecond, 1 * time.Second}
+	var lastErr error
+	for attempt, delay := range delays {
+		if err := fn(); err != nil {
+			lastErr = err
+			p.logger.Warn("Redis %s failed for task %s (attempt %d/3): %v", operation, taskID, attempt+1, err)
+			time.Sleep(delay)
+			continue
+		}
+		return nil
+	}
+	p.logger.Error("Redis %s permanently failed for task %s after 3 attempts: %v — manual investigation required", operation, taskID, lastErr)
+	return lastErr
+}
+
 // handleSuccess handles successful task completion.
 func (p *processor) handleSuccess(ctx context.Context, task *Task, queueName string) {
 	// Check if redis storage is enabled for this queue
@@ -207,14 +258,14 @@ func (p *processor) handleSuccess(ctx context.Context, task *Task, queueName str
 	}
 
 	if storeInRedis {
-		if err := p.redis.complete(ctx, task, queueName); err != nil {
-			p.logger.Error("Failed to mark task complete: %v", err)
-		}
+		p.redisRetry("complete", task.id, func() error {
+			return p.redis.complete(ctx, task, queueName)
+		})
 	} else {
 		// Just clean up the active queue without storing completion
-		if err := p.redis.cleanupActive(ctx, task, queueName); err != nil {
-			p.logger.Error("Failed to cleanup active task: %v", err)
-		}
+		p.redisRetry("cleanupActive", task.id, func() error {
+			return p.redis.cleanupActive(ctx, task, queueName)
+		})
 	}
 	if err := p.redis.incrementProcessed(ctx, queueName); err != nil {
 		p.logger.Error("Failed to increment processed counter: %v", err)
@@ -236,13 +287,13 @@ func (p *processor) handleError(ctx context.Context, task *Task, queueName strin
 	if IsSkipRetry(err) {
 		p.logger.Warn(fmt.Sprintf("Task %s marked as permanent failure, skipping retry", task.id))
 		if storeInRedis {
-			if failErr := p.redis.fail(ctx, task, queueName, err.Error()); failErr != nil {
-				p.logger.Error("Failed to mark task as failed: %v", failErr)
-			}
+			p.redisRetry("fail", task.id, func() error {
+				return p.redis.fail(ctx, task, queueName, err.Error())
+			})
 		} else {
-			if cleanupErr := p.redis.cleanupActive(ctx, task, queueName); cleanupErr != nil {
-				p.logger.Error("Failed to cleanup active task: %v", cleanupErr)
-			}
+			p.redisRetry("cleanupActive", task.id, func() error {
+				return p.redis.cleanupActive(ctx, task, queueName)
+			})
 		}
 		if incrErr := p.redis.incrementFailed(ctx, queueName); incrErr != nil {
 			p.logger.Error("Failed to increment failed counter: %v", incrErr)
@@ -262,20 +313,20 @@ func (p *processor) handleError(ctx context.Context, task *Task, queueName strin
 
 		p.logger.Info(fmt.Sprintf("Task %s will retry in %v (attempt %d/%d)", task.id, delay, task.retry+1, task.maxRetry))
 
-		if retryErr := p.redis.retry(ctx, task, queueName, delay); retryErr != nil {
-			p.logger.Error("Failed to schedule retry: %v", retryErr)
-		}
+		p.redisRetry("retry", task.id, func() error {
+			return p.redis.retry(ctx, task, queueName, delay)
+		})
 	} else {
 		p.logger.Warn(fmt.Sprintf("Task %s exceeded max retries (%d), marking as failed", task.id, task.maxRetry))
 
 		if storeInRedis {
-			if failErr := p.redis.fail(ctx, task, queueName, err.Error()); failErr != nil {
-				p.logger.Error("Failed to mark task as failed: %v", failErr)
-			}
+			p.redisRetry("fail", task.id, func() error {
+				return p.redis.fail(ctx, task, queueName, err.Error())
+			})
 		} else {
-			if cleanupErr := p.redis.cleanupActive(ctx, task, queueName); cleanupErr != nil {
-				p.logger.Error("Failed to cleanup active task: %v", cleanupErr)
-			}
+			p.redisRetry("cleanupActive", task.id, func() error {
+				return p.redis.cleanupActive(ctx, task, queueName)
+			})
 		}
 		if incrErr := p.redis.incrementFailed(ctx, queueName); incrErr != nil {
 			p.logger.Error("Failed to increment failed counter: %v", incrErr)

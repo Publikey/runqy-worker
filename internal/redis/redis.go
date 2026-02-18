@@ -322,16 +322,29 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 		}
 	}
 
-	// Move task to active queue (List) and lease tracking (Sorted Set)
+	// Atomically: move task to active queue, add to lease tracking, update state
 	activeKey := fmt.Sprintf(KeyActive, queueName)
 	leaseKey := fmt.Sprintf(KeyLease, queueName)
 	leaseExpiration := float64(time.Now().Add(30 * time.Minute).Unix())
-	r.Rdb.LPush(ctx, activeKey, taskID)
-	r.Rdb.ZAdd(ctx, leaseKey, redis.Z{Score: leaseExpiration, Member: taskID})
 
-	// Update task state to active and remove pending_since (asynq-compatible)
-	r.Rdb.HSet(ctx, taskKey, FieldState, StateActive)
-	r.Rdb.HDel(ctx, taskKey, FieldPendingSince)
+	activateScript := redis.NewScript(`
+		redis.call("LPUSH", KEYS[1], ARGV[1])
+		redis.call("ZADD", KEYS[2], ARGV[2], ARGV[1])
+		redis.call("HSET", KEYS[3], "state", ARGV[3])
+		redis.call("HDEL", KEYS[3], "pending_since")
+		return 1
+	`)
+	if err := activateScript.Run(ctx, r.Rdb,
+		[]string{activeKey, leaseKey, taskKey},
+		taskID, leaseExpiration, StateActive,
+	).Err(); err != nil {
+		r.Logger.Error("Lua activate script failed for task %s, falling back to non-atomic: %v", taskID, err)
+		// Fallback to non-atomic operations
+		r.Rdb.LPush(ctx, activeKey, taskID)
+		r.Rdb.ZAdd(ctx, leaseKey, redis.Z{Score: leaseExpiration, Member: taskID})
+		r.Rdb.HSet(ctx, taskKey, FieldState, StateActive)
+		r.Rdb.HDel(ctx, taskKey, FieldPendingSince)
+	}
 
 	taskData := &TaskData{
 		ID:       taskID,
@@ -427,13 +440,23 @@ func (r *Client) Retry(ctx context.Context, task *TaskData, queueName string, de
 		retryAt := float64(now.Add(delay).Unix())
 		r.Rdb.ZAdd(ctx, retryKey, redis.Z{Score: retryAt, Member: task.ID})
 
-		// Start a goroutine to move the task from retry to pending when ready
+		// Start a goroutine to move the task from retry to pending when ready.
+		// Use the caller's context so goroutine is cancelled at shutdown.
 		go func() {
-			time.Sleep(delay)
-			// Move from retry to pending
-			r.Rdb.ZRem(context.Background(), retryKey, task.ID)
-			r.Rdb.LPush(context.Background(), pendingKey, task.ID)
-			r.Rdb.HSet(context.Background(), taskKey, FieldState, StatePending)
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				// Move from retry to pending
+				moveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				r.Rdb.ZRem(moveCtx, retryKey, task.ID)
+				r.Rdb.LPush(moveCtx, pendingKey, task.ID)
+				r.Rdb.HSet(moveCtx, taskKey, FieldState, StatePending)
+			case <-ctx.Done():
+				// Shutdown — leave task in retry set for next worker pickup
+				r.Logger.Info("Retry goroutine cancelled for task %s (shutdown)", task.ID)
+			}
 		}()
 	} else {
 		// No delay, push directly to pending

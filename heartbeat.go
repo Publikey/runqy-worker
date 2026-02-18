@@ -105,7 +105,13 @@ func (h *heartbeat) updateQueues(queues map[string]int) {
 
 // stop stops sending heartbeats.
 func (h *heartbeat) stop() {
-	close(h.done)
+	select {
+	case <-h.done:
+		// Already closed
+		return
+	default:
+		close(h.done)
+	}
 	h.wg.Wait()
 
 	// Remove worker from registry

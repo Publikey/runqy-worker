@@ -153,12 +153,19 @@ func (r *redisReconnector) reconnectLocked() bool {
 	r.currentClient = newClient
 	r.consecutiveErrs = 0
 
-	// Notify dependent components
-	if r.onReconnect != nil {
-		r.onReconnect(newClient)
+	// Save callback and release lock before invoking it to avoid deadlocks
+	callback := r.onReconnect
+	r.mu.Unlock()
+
+	// Notify dependent components (outside lock)
+	if callback != nil {
+		callback(newClient)
 	}
 
 	r.logger.Info("Redis reconnection complete")
+
+	// Re-acquire lock (caller expects it held via defer r.mu.Unlock)
+	r.mu.Lock()
 	return true
 }
 

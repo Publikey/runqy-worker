@@ -141,11 +141,28 @@ func (h *StdioHandler) ProcessTask(ctx context.Context, task Task) error {
 		return fmt.Errorf("failed to marshal task request: %w", err)
 	}
 
-	// Write request line (with newline)
+	// Write request line (with newline), guarded against closed pipe panic
 	h.logger.Debug("Sending task %s to child process", taskID)
 	reqLine := append(reqBytes, '\n')
-	if _, err := h.stdin.Write(reqLine); err != nil {
-		return fmt.Errorf("failed to write to stdin: %w", err)
+
+	h.mu.RLock()
+	closed := h.closed
+	h.mu.RUnlock()
+	if closed {
+		return fmt.Errorf("stdio handler is closed")
+	}
+
+	var writeErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				writeErr = fmt.Errorf("panic writing to stdin: %v", r)
+			}
+		}()
+		_, writeErr = h.stdin.Write(reqLine)
+	}()
+	if writeErr != nil {
+		return fmt.Errorf("failed to write to stdin: %w", writeErr)
 	}
 
 	// Wait for response
@@ -193,10 +210,15 @@ func (h *StdioHandler) handleResponse(resp *StdioTaskResponse, task Task) error 
 // It waits for the old readResponses goroutine to finish, fails all pending tasks,
 // then starts a new readResponses goroutine with the new pipes.
 func (h *StdioHandler) Reconnect(stdin io.Writer, stdout io.Reader) {
+	// Mark as closed first so ProcessTask() rejects new tasks during reconnect
+	h.mu.Lock()
+	h.closed = true
+	h.mu.Unlock()
+
 	// Wait for old readResponses to finish (it exits when stdout closes)
 	h.wg.Wait()
 
-	// Fail all pending tasks
+	// Fail all pending tasks and swap pipes atomically
 	h.mu.Lock()
 	for taskID, ch := range h.pending {
 		close(ch)
