@@ -383,8 +383,8 @@ func (r *Client) Complete(ctx context.Context, taskID string, queueName string) 
 }
 
 // Retry re-queues a task for retry using the retry sorted set.
-func (r *Client) Retry(ctx context.Context, taskID string, queueName string, delay time.Duration) error {
-	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
+func (r *Client) Retry(ctx context.Context, task *TaskData, queueName string, delay time.Duration) error {
+	taskKey := fmt.Sprintf(KeyTask, queueName, task.ID)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
 	leaseKey := fmt.Sprintf(KeyLease, queueName)
 	retryKey := fmt.Sprintf(KeyRetry, queueName)
@@ -393,16 +393,26 @@ func (r *Client) Retry(ctx context.Context, taskID string, queueName string, del
 	now := time.Now()
 
 	// Remove from active queue (List) and lease tracking (Sorted Set)
-	r.Rdb.LRem(ctx, activeKey, 1, taskID)
-	r.Rdb.ZRem(ctx, leaseKey, taskID)
+	r.Rdb.LRem(ctx, activeKey, 1, task.ID)
+	r.Rdb.ZRem(ctx, leaseKey, task.ID)
 
-	// Update the protobuf msg field with incremented retry count (for asynqmon compatibility)
+	// Update the protobuf msg field with incremented retry count (for asynqmon compatibility).
+	// If the msg field is missing, create it from the task data.
 	if msgData, err := r.Rdb.HGet(ctx, taskKey, FieldMsg).Result(); err == nil {
 		if asynqMsg, err := parseAsynqMessage([]byte(msgData)); err == nil {
 			asynqMsg.Retried++
 			updatedMsg := encodeAsynqMessage(asynqMsg)
 			r.Rdb.HSet(ctx, taskKey, FieldMsg, string(updatedMsg))
 		}
+	} else {
+		msg := encodeAsynqMessage(&asynqTaskMessage{
+			Type:     task.Type,
+			ID:       task.ID,
+			Queue:    queueName,
+			MaxRetry: task.MaxRetry,
+			Retried:  task.Retry + 1,
+		})
+		r.Rdb.HSet(ctx, taskKey, FieldMsg, string(msg))
 	}
 
 	// Increment retry count in hash field and update state
@@ -415,19 +425,19 @@ func (r *Client) Retry(ctx context.Context, taskID string, queueName string, del
 	if delay > 0 {
 		// Add to retry sorted set with scheduled time as score
 		retryAt := float64(now.Add(delay).Unix())
-		r.Rdb.ZAdd(ctx, retryKey, redis.Z{Score: retryAt, Member: taskID})
+		r.Rdb.ZAdd(ctx, retryKey, redis.Z{Score: retryAt, Member: task.ID})
 
 		// Start a goroutine to move the task from retry to pending when ready
 		go func() {
 			time.Sleep(delay)
 			// Move from retry to pending
-			r.Rdb.ZRem(context.Background(), retryKey, taskID)
-			r.Rdb.LPush(context.Background(), pendingKey, taskID)
+			r.Rdb.ZRem(context.Background(), retryKey, task.ID)
+			r.Rdb.LPush(context.Background(), pendingKey, task.ID)
 			r.Rdb.HSet(context.Background(), taskKey, FieldState, StatePending)
 		}()
 	} else {
 		// No delay, push directly to pending
-		r.Rdb.LPush(ctx, pendingKey, taskID)
+		r.Rdb.LPush(ctx, pendingKey, task.ID)
 		r.Rdb.HSet(ctx, taskKey, FieldState, StatePending)
 	}
 
@@ -435,8 +445,8 @@ func (r *Client) Retry(ctx context.Context, taskID string, queueName string, del
 }
 
 // Fail marks a task as permanently failed (archived).
-func (r *Client) Fail(ctx context.Context, taskID string, queueName string, errMsg string) error {
-	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
+func (r *Client) Fail(ctx context.Context, task *TaskData, queueName string, errMsg string) error {
+	taskKey := fmt.Sprintf(KeyTask, queueName, task.ID)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
 	leaseKey := fmt.Sprintf(KeyLease, queueName)
 	archivedKey := fmt.Sprintf(KeyArchived, queueName)
@@ -444,8 +454,21 @@ func (r *Client) Fail(ctx context.Context, taskID string, queueName string, errM
 	now := time.Now().Unix()
 
 	// Remove from active queue (List) and lease tracking (Sorted Set)
-	r.Rdb.LRem(ctx, activeKey, 1, taskID)
-	r.Rdb.ZRem(ctx, leaseKey, taskID)
+	r.Rdb.LRem(ctx, activeKey, 1, task.ID)
+	r.Rdb.ZRem(ctx, leaseKey, task.ID)
+
+	// Ensure the msg protobuf field exists for asynq inspector compatibility.
+	// If missing, create it from the task data we have.
+	if exists, _ := r.Rdb.HExists(ctx, taskKey, FieldMsg).Result(); !exists {
+		msg := encodeAsynqMessage(&asynqTaskMessage{
+			Type:     task.Type,
+			ID:       task.ID,
+			Queue:    queueName,
+			MaxRetry: task.MaxRetry,
+			Retried:  task.Retry,
+		})
+		r.Rdb.HSet(ctx, taskKey, FieldMsg, string(msg))
+	}
 
 	// Update task hash: state, error message, and last failed timestamp
 	r.Rdb.HSet(ctx, taskKey,
@@ -455,7 +478,7 @@ func (r *Client) Fail(ctx context.Context, taskID string, queueName string, errM
 	)
 
 	// Add to archived sorted set with Unix timestamp as score
-	r.Rdb.ZAdd(ctx, archivedKey, redis.Z{Score: float64(now), Member: taskID})
+	r.Rdb.ZAdd(ctx, archivedKey, redis.Z{Score: float64(now), Member: task.ID})
 
 	return nil
 }
