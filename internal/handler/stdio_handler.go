@@ -148,6 +148,7 @@ func (h *StdioHandler) ProcessTask(ctx context.Context, task Task) error {
 
 	h.mu.RLock()
 	closed := h.closed
+	doneCh := h.done // capture under lock to avoid race with Reconnect
 	h.mu.RUnlock()
 	if closed {
 		return fmt.Errorf("stdio handler is closed")
@@ -180,7 +181,7 @@ func (h *StdioHandler) ProcessTask(ctx context.Context, task Task) error {
 	case <-ctx.Done():
 		return ctx.Err()
 
-	case <-h.done:
+	case <-doneCh:
 		return fmt.Errorf("handler stopped while waiting for response")
 	}
 }
@@ -222,17 +223,26 @@ func (h *StdioHandler) Reconnect(stdin io.Writer, stdout io.Reader) {
 	h.wg.Wait()
 
 	// Fail all pending tasks and swap pipes atomically
+	h.stdinMu.Lock()
 	h.mu.Lock()
+	// Close old done channel to wake up any ProcessTask selects
+	select {
+	case <-h.done:
+		// already closed
+	default:
+		close(h.done)
+	}
 	for taskID, ch := range h.pending {
 		close(ch)
 		delete(h.pending, taskID)
 	}
-	// Swap pipes and reset state
+	// Swap pipes and reset state — stdinMu held to sync with ProcessTask
 	h.stdin = stdin
 	h.stdout = stdout
 	h.closed = false
 	h.done = make(chan struct{})
 	h.mu.Unlock()
+	h.stdinMu.Unlock()
 
 	// Start new readResponses goroutine
 	h.wg.Add(1)
