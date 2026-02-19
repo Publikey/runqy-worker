@@ -162,9 +162,18 @@ func parseAsynqMessage(data []byte) (*asynqTaskMessage, error) {
 			case 4:
 				msg.Queue = string(value)
 			}
+		case 1: // Fixed 64-bit
+			if pos+8 > len(data) {
+				return nil, fmt.Errorf("invalid protobuf: fixed64 exceeds data")
+			}
+			pos += 8
+		case 5: // Fixed 32-bit
+			if pos+4 > len(data) {
+				return nil, fmt.Errorf("invalid protobuf: fixed32 exceeds data")
+			}
+			pos += 4
 		default:
-			// Skip unknown wire types
-			return nil, fmt.Errorf("unsupported wire type: %d", wireType)
+			return nil, fmt.Errorf("invalid wire type: %d", wireType)
 		}
 	}
 

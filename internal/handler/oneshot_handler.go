@@ -169,77 +169,104 @@ func (h *OneShotHandler) ProcessTask(ctx context.Context, task Task) error {
 }
 
 // waitForReady waits for the {"status":"ready"} signal.
+// Reads run in a goroutine so that ctx cancellation is detected immediately
+// (the process kill from CommandContext will close the pipe and unblock the read).
 func (h *OneShotHandler) waitForReady(ctx context.Context, reader *bufio.Reader, taskID string) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
+	readyCh := make(chan struct{})
+	errCh := make(chan error, 1)
 
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				return fmt.Errorf("stdout closed before ready signal")
+	go func() {
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					errCh <- fmt.Errorf("stdout closed before ready signal")
+				} else {
+					errCh <- fmt.Errorf("error reading stdout: %w", err)
+				}
+				return
 			}
-			return fmt.Errorf("error reading stdout: %w", err)
-		}
 
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
 
-		h.logger.Debug("OneShot[%s]: stdout: %s", taskID, line)
+			h.logger.Debug("OneShot[%s]: stdout: %s", taskID, line)
 
-		var status struct {
-			Status string `json:"status"`
-		}
-		if err := json.Unmarshal([]byte(line), &status); err == nil {
-			if status.Status == "ready" {
-				h.logger.Debug("OneShot[%s]: ready signal received", taskID)
-				return nil
+			var status struct {
+				Status string `json:"status"`
+			}
+			if err := json.Unmarshal([]byte(line), &status); err == nil {
+				if status.Status == "ready" {
+					h.logger.Debug("OneShot[%s]: ready signal received", taskID)
+					close(readyCh)
+					return
+				}
 			}
 		}
+	}()
+
+	select {
+	case <-readyCh:
+		return nil
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
 // readResponse reads the task response from stdout.
+// Reads run in a goroutine so that ctx cancellation is detected immediately
+// (the process kill from CommandContext will close the pipe and unblock the read).
 func (h *OneShotHandler) readResponse(ctx context.Context, reader *bufio.Reader, taskID string) (*StdioTaskResponse, error) {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
+	type result struct {
+		resp *StdioTaskResponse
+		err  error
+	}
+	resultCh := make(chan result, 1)
 
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				return nil, fmt.Errorf("stdout closed before response received")
+	go func() {
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					resultCh <- result{err: fmt.Errorf("stdout closed before response received")}
+				} else {
+					resultCh <- result{err: fmt.Errorf("error reading response: %w", err)}
+				}
+				return
 			}
-			return nil, fmt.Errorf("error reading response: %w", err)
+
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+
+			h.logger.Debug("OneShot[%s]: response line: %s", taskID, line)
+
+			var resp StdioTaskResponse
+			if err := json.Unmarshal([]byte(line), &resp); err != nil {
+				h.logger.Warn("OneShot[%s]: failed to parse response: %v", taskID, err)
+				continue
+			}
+
+			if resp.TaskID == taskID {
+				resultCh <- result{resp: &resp}
+				return
+			}
+
+			// Skip status messages or other non-matching responses
+			h.logger.Debug("OneShot[%s]: ignoring response for different task: %s", taskID, resp.TaskID)
 		}
+	}()
 
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		h.logger.Debug("OneShot[%s]: response line: %s", taskID, line)
-
-		var resp StdioTaskResponse
-		if err := json.Unmarshal([]byte(line), &resp); err != nil {
-			h.logger.Warn("OneShot[%s]: failed to parse response: %v", taskID, err)
-			continue
-		}
-
-		if resp.TaskID == taskID {
-			return &resp, nil
-		}
-
-		// Skip status messages or other non-matching responses
-		h.logger.Debug("OneShot[%s]: ignoring response for different task: %s", taskID, resp.TaskID)
+	select {
+	case r := <-resultCh:
+		return r.resp, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 

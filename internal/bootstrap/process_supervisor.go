@@ -277,18 +277,21 @@ func (s *ProcessSupervisor) monitorProcess() {
 
 	s.mu.Lock()
 	s.healthy = false
-	s.crashed = true
-	s.crashedAt = time.Now()
-
 	if s.cmd.ProcessState != nil {
 		s.exitCode = s.cmd.ProcessState.ExitCode()
+	}
+	if err != nil || s.exitCode != 0 {
+		s.crashed = true
+		s.crashedAt = time.Now()
 	}
 	s.mu.Unlock()
 
 	if err != nil {
 		s.logger.Error("Process exited with error: %v (exit code: %d)", err, s.exitCode)
+	} else if s.exitCode != 0 {
+		s.logger.Error("Process exited with non-zero exit code: %d", s.exitCode)
 	} else {
-		s.logger.Warn("Process exited normally (exit code: %d)", s.exitCode)
+		s.logger.Info("Process exited normally (exit code: 0)")
 	}
 
 	close(s.done)
