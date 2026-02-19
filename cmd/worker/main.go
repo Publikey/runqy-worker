@@ -89,8 +89,36 @@ func validateConfig(cfg *worker.Config) error {
 	if len(cfg.QueueNames) == 0 {
 		return fmt.Errorf("worker.queues (or worker.queue) is required")
 	}
+	// Filter out empty queue names
+	var validQueues []string
+	for _, q := range cfg.QueueNames {
+		if q != "" {
+			validQueues = append(validQueues, q)
+		}
+	}
+	if len(validQueues) == 0 {
+		return fmt.Errorf("worker.queues contains only empty strings")
+	}
+	cfg.QueueNames = validQueues
+
 	if cfg.Concurrency <= 0 {
 		return fmt.Errorf("worker.concurrency must be > 0")
+	}
+	// Validate durations are not negative
+	if cfg.ShutdownTimeout < 0 {
+		return fmt.Errorf("worker.shutdown_timeout must not be negative")
+	}
+	if cfg.BootstrapRetryDelay < 0 {
+		return fmt.Errorf("bootstrap.retry_delay must not be negative")
+	}
+	if cfg.Recovery.InitialDelay < 0 {
+		return fmt.Errorf("recovery.initial_delay must not be negative")
+	}
+	if cfg.Recovery.MaxDelay < 0 {
+		return fmt.Errorf("recovery.max_delay must not be negative")
+	}
+	if cfg.Recovery.CooldownPeriod < 0 {
+		return fmt.Errorf("recovery.cooldown_period must not be negative")
 	}
 	return nil
 }

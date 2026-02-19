@@ -49,9 +49,10 @@ type Worker struct {
 	// Redis connection config (stored during bootstrap for reconnection)
 	redisConnConfig *RedisConnConfig
 
-	done   chan struct{}
-	wg     sync.WaitGroup
-	logger Logger
+	done         chan struct{}
+	shutdownOnce sync.Once
+	wg           sync.WaitGroup
+	logger       Logger
 }
 
 // New creates a new Worker with the given configuration.
@@ -757,8 +758,11 @@ func (w *Worker) Start(ctx context.Context) error {
 }
 
 // Shutdown initiates a graceful shutdown of the worker.
+// Safe to call multiple times.
 func (w *Worker) Shutdown() {
-	close(w.done)
+	w.shutdownOnce.Do(func() {
+		close(w.done)
+	})
 }
 
 // shutdown performs the actual shutdown sequence.
@@ -794,13 +798,9 @@ func (w *Worker) shutdown() error {
 		}
 	}
 
-	// Clean up deployment directories
-	if w.bootstrapped && w.config.DeploymentDir != "" {
-		w.logger.Info("Cleaning up deployment directory: %s", w.config.DeploymentDir)
-		if err := os.RemoveAll(w.config.DeploymentDir); err != nil {
-			w.logger.Error("Error cleaning up deployment directory: %v", err)
-		}
-	}
+	// Note: deployment directory is intentionally NOT cleaned up on shutdown.
+	// Existing deployments are reused across restarts for fast restart.
+	// Users can manually delete the deployment directory to force a fresh clone.
 
 	w.logger.Info("Closing Redis connection...")
 	if w.rdb != nil {

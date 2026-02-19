@@ -33,6 +33,7 @@ type StdioHandler struct {
 	stdout  io.Reader
 	pending map[string]chan *StdioTaskResponse
 	mu      sync.RWMutex
+	stdinMu sync.Mutex // serializes writes to stdin to prevent interleaving with concurrency > 1
 	logger  Logger
 
 	redisStorage bool
@@ -159,7 +160,9 @@ func (h *StdioHandler) ProcessTask(ctx context.Context, task Task) error {
 				writeErr = fmt.Errorf("panic writing to stdin: %v", r)
 			}
 		}()
+		h.stdinMu.Lock()
 		_, writeErr = h.stdin.Write(reqLine)
+		h.stdinMu.Unlock()
 	}()
 	if writeErr != nil {
 		return fmt.Errorf("failed to write to stdin: %w", writeErr)
@@ -291,9 +294,10 @@ func (h *StdioHandler) readResponses() {
 	h.logger.Info("Stdout reader stopped")
 }
 
-// ReadySignal is sent by the child process to indicate it's ready.
+// ReadySignal is sent by the child process to indicate it's ready or has failed.
 type ReadySignal struct {
 	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
 }
 
 // WaitForReady waits for the child process to send a ready signal.
@@ -324,6 +328,10 @@ func WaitForReady(ctx context.Context, stdout io.Reader, logger Logger) error {
 
 			if signal.Status == "ready" {
 				close(readyCh)
+				return
+			}
+			if signal.Status == "error" {
+				errCh <- fmt.Errorf("process startup failed: %s", signal.Error)
 				return
 			}
 		}

@@ -167,10 +167,15 @@ func (s *ProcessSupervisor) waitForReady(ctx context.Context, timeout time.Durat
 			// Try to parse as JSON status message
 			var status struct {
 				Status string `json:"status"`
+				Error  string `json:"error"`
 			}
 			if err := json.Unmarshal([]byte(line), &status); err == nil {
 				if status.Status == "ready" {
 					close(readyCh)
+					return
+				}
+				if status.Status == "error" {
+					errCh <- fmt.Errorf("process startup failed: %s", status.Error)
 					return
 				}
 			}

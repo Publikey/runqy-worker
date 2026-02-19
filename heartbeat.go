@@ -296,7 +296,7 @@ func (h *heartbeat) deregister(ctx context.Context) {
 	rdb := h.rdb
 	h.mu.RUnlock()
 
-	rdb.SRem(ctx, keyWorkers, h.workerID)
+	rdb.ZRem(ctx, keyWorkers, h.workerID)
 
 	workerKey := fmt.Sprintf(keyWorkerData, h.workerID)
 	rdb.HSet(ctx, workerKey, "status", "stopped")
