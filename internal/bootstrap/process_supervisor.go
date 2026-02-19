@@ -40,8 +40,7 @@ type ProcessSupervisor struct {
 	restartCount int
 	lastRestart  time.Time
 
-	done   chan struct{}
-	cancel context.CancelFunc
+	done chan struct{}
 }
 
 // NewProcessSupervisor creates a new ProcessSupervisor.
@@ -76,12 +75,9 @@ func (s *ProcessSupervisor) Start(ctx context.Context) error {
 		s.logger.Debug("Using venv python: %s", args[0])
 	}
 
-	// Create a cancellable context for the process
-	procCtx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
-
-	// Build the command
-	s.cmd = exec.CommandContext(procCtx, args[0], args[1:]...)
+	// Build the command without context binding — we manage shutdown ourselves
+	// (exec.CommandContext sends SIGKILL on cancel, we want SIGTERM first)
+	s.cmd = exec.Command(args[0], args[1:]...)
 	s.cmd.Dir = s.deployment.CodePath
 
 	// Build environment
@@ -320,6 +316,8 @@ func (s *ProcessSupervisor) CrashedAt() time.Time {
 }
 
 // Stop stops the supervised process gracefully.
+// On Unix: sends SIGTERM, waits grace period, then SIGKILL.
+// On Windows: sends Kill() directly (no SIGTERM support).
 func (s *ProcessSupervisor) Stop() error {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return nil
@@ -327,16 +325,14 @@ func (s *ProcessSupervisor) Stop() error {
 
 	s.logger.Info("Stopping supervised process (PID %d)...", s.cmd.Process.Pid)
 
-	// Cancel the context to signal shutdown
-	if s.cancel != nil {
-		s.cancel()
-	}
-
-	// On Windows, we can only kill (no SIGTERM)
-	// On Unix, the context cancellation sends SIGKILL by default
-	// We'll give it a grace period then force kill
 	gracePeriod := 10 * time.Second
 
+	// Send graceful termination signal (SIGTERM on Unix, Kill on Windows)
+	if err := sendTermSignal(s.cmd.Process); err != nil {
+		s.logger.Warn("Failed to send termination signal: %v", err)
+	}
+
+	// Wait for graceful exit
 	select {
 	case <-s.done:
 		s.logger.Info("Process stopped gracefully")
@@ -394,7 +390,6 @@ func (s *ProcessSupervisor) Restart(ctx context.Context) error {
 	s.stdin = nil
 	s.stdout = nil
 	s.stdoutReader = nil
-	s.cancel = nil
 	s.done = make(chan struct{})
 	s.mu.Unlock()
 
