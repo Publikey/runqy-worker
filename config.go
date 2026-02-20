@@ -46,6 +46,9 @@ type Config struct {
 	// Logger (optional, defaults to standard logger)
 	Logger Logger
 
+	// Process recovery
+	Recovery RecoveryConfig // Auto-recovery settings for crashed processes
+
 	// Queue handler configuration (for config-driven workers)
 	QueueHandlers map[string]*HandlerConfig // queue name -> handler config
 	Defaults      DefaultsConfig
@@ -72,6 +75,7 @@ func DefaultConfig() Config {
 		MaxRetry:        25,
 		ShutdownTimeout: 8 * time.Second,
 		Logger:          NewStdLogger(),
+		Recovery:        DefaultRecoveryConfig(),
 	}
 }
 

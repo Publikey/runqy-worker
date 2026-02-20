@@ -26,8 +26,9 @@ type QueueState struct {
 	Supervisor     *ProcessSupervisor
 	StdioHandler   *StdioHandler
 	OneShotHandler *OneShotHandler
-	Mode           string // "long_running" or "one_shot"
-	RedisStorage   bool   // Whether to store results/completion in Redis
+	Recovery       *processRecovery // Auto-recovery watcher (nil for one_shot mode)
+	Mode           string           // "long_running" or "one_shot"
+	RedisStorage   bool             // Whether to store results/completion in Redis
 }
 
 // Worker processes tasks from Redis queues.
@@ -48,9 +49,10 @@ type Worker struct {
 	// Redis connection config (stored during bootstrap for reconnection)
 	redisConnConfig *RedisConnConfig
 
-	done   chan struct{}
-	wg     sync.WaitGroup
-	logger Logger
+	done         chan struct{}
+	shutdownOnce sync.Once
+	wg           sync.WaitGroup
+	logger       Logger
 }
 
 // New creates a new Worker with the given configuration.
@@ -453,6 +455,19 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 			state.StdioHandler.SetLogBuffer(w.logBuffer)
 		}
 		state.StdioHandler.Start()
+
+		// Set up auto-recovery for the supervised process
+		if w.config.Recovery.Enabled {
+			recovery := newProcessRecovery(parentQueue, state.Supervisor, w.config.Recovery, w.logger)
+			recovery.SetOnRestart(func(sup *ProcessSupervisor) {
+				state.StdioHandler.Reconnect(sup.Stdin(), sup.Stdout())
+			})
+			recovery.Start()
+			state.Recovery = recovery
+			w.logger.Info("[%s] Auto-recovery enabled (max_restarts=%d, cooldown=%v)",
+				parentQueue, w.config.Recovery.MaxRestarts, w.config.Recovery.CooldownPeriod)
+		}
+
 		// Register handler only for configured sub-queues (they share the same stdio handler)
 		for _, sq := range subQueuesToListen {
 			w.HandleQueue(sq.Name, state.StdioHandler.ProcessTask)
@@ -466,6 +481,10 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 // cleanupQueueStates cleans up all bootstrapped queue states.
 func (w *Worker) cleanupQueueStates() {
 	for name, state := range w.queueStates {
+		// Stop recovery first to prevent restarts during cleanup
+		if state.Recovery != nil {
+			state.Recovery.Stop()
+		}
 		if state.StdioHandler != nil {
 			state.StdioHandler.Stop()
 		}
@@ -739,8 +758,11 @@ func (w *Worker) Start(ctx context.Context) error {
 }
 
 // Shutdown initiates a graceful shutdown of the worker.
+// Safe to call multiple times.
 func (w *Worker) Shutdown() {
-	close(w.done)
+	w.shutdownOnce.Do(func() {
+		close(w.done)
+	})
 }
 
 // shutdown performs the actual shutdown sequence.
@@ -756,9 +778,14 @@ func (w *Worker) shutdown() error {
 	}
 
 	// Stop all queue supervisors and handlers
-	// IMPORTANT: Stop supervisor FIRST (kills process, closes stdout)
+	// IMPORTANT: Stop recovery FIRST (prevents restart during shutdown)
+	// then stop supervisor (kills process, closes stdout)
 	// then stop StdioHandler (which waits for stdout to close)
 	for name, state := range w.queueStates {
+		if state.Recovery != nil {
+			w.logger.Info("Stopping recovery watcher for queue: %s", name)
+			state.Recovery.Stop()
+		}
 		if state.Supervisor != nil {
 			w.logger.Info("Stopping supervised process for queue: %s", name)
 			if err := state.Supervisor.Stop(); err != nil {
@@ -771,13 +798,9 @@ func (w *Worker) shutdown() error {
 		}
 	}
 
-	// Clean up deployment directories
-	if w.bootstrapped && w.config.DeploymentDir != "" {
-		w.logger.Info("Cleaning up deployment directory: %s", w.config.DeploymentDir)
-		if err := os.RemoveAll(w.config.DeploymentDir); err != nil {
-			w.logger.Error("Error cleaning up deployment directory: %v", err)
-		}
-	}
+	// Note: deployment directory is intentionally NOT cleaned up on shutdown.
+	// Existing deployments are reused across restarts for fast restart.
+	// Users can manually delete the deployment directory to force a fresh clone.
 
 	w.logger.Info("Closing Redis connection...")
 	if w.rdb != nil {

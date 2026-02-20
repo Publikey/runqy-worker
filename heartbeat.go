@@ -105,7 +105,13 @@ func (h *heartbeat) updateQueues(queues map[string]int) {
 
 // stop stops sending heartbeats.
 func (h *heartbeat) stop() {
-	close(h.done)
+	select {
+	case <-h.done:
+		// Already closed
+		return
+	default:
+		close(h.done)
+	}
 	h.wg.Wait()
 
 	// Remove worker from registry
@@ -199,6 +205,25 @@ func (h *heartbeat) beat(ctx context.Context) {
 	if m, err := collectMetrics(); err == nil {
 		if b, err := json.Marshal(m); err == nil {
 			beatData["metrics"] = string(b)
+		}
+	}
+
+	// Add recovery state info per queue
+	if h.queueStates != nil {
+		recoveryInfo := make(map[string]interface{})
+		for name, state := range h.queueStates {
+			if state.Recovery != nil {
+				recoveryInfo[name] = map[string]interface{}{
+					"state":             string(state.Recovery.State()),
+					"consecutive_fails": state.Recovery.ConsecutiveFails(),
+					"total_restarts":    state.Recovery.TotalRestarts(),
+				}
+			}
+		}
+		if len(recoveryInfo) > 0 {
+			if b, err := json.Marshal(recoveryInfo); err == nil {
+				beatData["recovery"] = string(b)
+			}
 		}
 	}
 

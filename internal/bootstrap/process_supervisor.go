@@ -37,8 +37,10 @@ type ProcessSupervisor struct {
 	crashedAt time.Time
 	exitCode  int
 
-	done   chan struct{}
-	cancel context.CancelFunc
+	restartCount int
+	lastRestart  time.Time
+
+	done chan struct{}
 }
 
 // NewProcessSupervisor creates a new ProcessSupervisor.
@@ -73,12 +75,9 @@ func (s *ProcessSupervisor) Start(ctx context.Context) error {
 		s.logger.Debug("Using venv python: %s", args[0])
 	}
 
-	// Create a cancellable context for the process
-	procCtx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
-
-	// Build the command
-	s.cmd = exec.CommandContext(procCtx, args[0], args[1:]...)
+	// Build the command without context binding — we manage shutdown ourselves
+	// (exec.CommandContext sends SIGKILL on cancel, we want SIGTERM first)
+	s.cmd = exec.Command(args[0], args[1:]...)
 	s.cmd.Dir = s.deployment.CodePath
 
 	// Build environment
@@ -164,10 +163,15 @@ func (s *ProcessSupervisor) waitForReady(ctx context.Context, timeout time.Durat
 			// Try to parse as JSON status message
 			var status struct {
 				Status string `json:"status"`
+				Error  string `json:"error"`
 			}
 			if err := json.Unmarshal([]byte(line), &status); err == nil {
 				if status.Status == "ready" {
 					close(readyCh)
+					return
+				}
+				if status.Status == "error" {
+					errCh <- fmt.Errorf("process startup failed: %s", status.Error)
 					return
 				}
 			}
@@ -273,18 +277,21 @@ func (s *ProcessSupervisor) monitorProcess() {
 
 	s.mu.Lock()
 	s.healthy = false
-	s.crashed = true
-	s.crashedAt = time.Now()
-
 	if s.cmd.ProcessState != nil {
 		s.exitCode = s.cmd.ProcessState.ExitCode()
+	}
+	if err != nil || s.exitCode != 0 {
+		s.crashed = true
+		s.crashedAt = time.Now()
 	}
 	s.mu.Unlock()
 
 	if err != nil {
 		s.logger.Error("Process exited with error: %v (exit code: %d)", err, s.exitCode)
+	} else if s.exitCode != 0 {
+		s.logger.Error("Process exited with non-zero exit code: %d", s.exitCode)
 	} else {
-		s.logger.Warn("Process exited normally (exit code: %d)", s.exitCode)
+		s.logger.Info("Process exited normally (exit code: 0)")
 	}
 
 	close(s.done)
@@ -312,6 +319,8 @@ func (s *ProcessSupervisor) CrashedAt() time.Time {
 }
 
 // Stop stops the supervised process gracefully.
+// On Unix: sends SIGTERM, waits grace period, then SIGKILL.
+// On Windows: sends Kill() directly (no SIGTERM support).
 func (s *ProcessSupervisor) Stop() error {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return nil
@@ -319,16 +328,14 @@ func (s *ProcessSupervisor) Stop() error {
 
 	s.logger.Info("Stopping supervised process (PID %d)...", s.cmd.Process.Pid)
 
-	// Cancel the context to signal shutdown
-	if s.cancel != nil {
-		s.cancel()
-	}
-
-	// On Windows, we can only kill (no SIGTERM)
-	// On Unix, the context cancellation sends SIGKILL by default
-	// We'll give it a grace period then force kill
 	gracePeriod := 10 * time.Second
 
+	// Send graceful termination signal (SIGTERM on Unix, Kill on Windows)
+	if err := sendTermSignal(s.cmd.Process); err != nil {
+		s.logger.Warn("Failed to send termination signal: %v", err)
+	}
+
+	// Wait for graceful exit
 	select {
 	case <-s.done:
 		s.logger.Info("Process stopped gracefully")
@@ -356,6 +363,71 @@ func (s *ProcessSupervisor) Stop() error {
 // Done returns a channel that's closed when the process exits.
 func (s *ProcessSupervisor) Done() <-chan struct{} {
 	return s.done
+}
+
+// Restart stops the current process (if running), resets internal state,
+// and starts a new process. Returns an error if the new process fails to start.
+func (s *ProcessSupervisor) Restart(ctx context.Context) error {
+	s.logger.Info("Restarting supervised process...")
+
+	// Stop the existing process if it hasn't exited yet
+	select {
+	case <-s.done:
+		// Process already exited, no need to stop
+		s.logger.Debug("Process already exited, skipping stop")
+	default:
+		if err := s.Stop(); err != nil {
+			s.logger.Warn("Error stopping process during restart: %v", err)
+		}
+		// Wait for done to be closed by monitorProcess
+		<-s.done
+	}
+
+	// Reset internal state
+	s.mu.Lock()
+	s.healthy = false
+	s.crashed = false
+	s.crashedAt = time.Time{}
+	s.exitCode = 0
+	s.cmd = nil
+	s.stdin = nil
+	s.stdout = nil
+	s.stdoutReader = nil
+	s.done = make(chan struct{})
+	s.mu.Unlock()
+
+	// Start the new process
+	if err := s.Start(ctx); err != nil {
+		return fmt.Errorf("restart failed: %w", err)
+	}
+
+	// Update restart tracking
+	s.mu.Lock()
+	s.restartCount++
+	s.lastRestart = time.Now()
+	s.mu.Unlock()
+
+	s.logger.Info("Process restarted successfully (total restarts: %d)", s.restartCount)
+	return nil
+}
+
+// RestartCount returns the number of times the process has been restarted.
+func (s *ProcessSupervisor) RestartCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.restartCount
+}
+
+// LastRestart returns the time of the last restart.
+func (s *ProcessSupervisor) LastRestart() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastRestart
+}
+
+// TimeoutSec returns the startup timeout in seconds.
+func (s *ProcessSupervisor) TimeoutSec() int {
+	return s.timeoutSec
 }
 
 // ParseCommand splits a command string into executable and arguments.

@@ -33,6 +33,7 @@ type StdioHandler struct {
 	stdout  io.Reader
 	pending map[string]chan *StdioTaskResponse
 	mu      sync.RWMutex
+	stdinMu sync.Mutex // serializes writes to stdin to prevent interleaving with concurrency > 1
 	logger  Logger
 
 	redisStorage bool
@@ -141,11 +142,31 @@ func (h *StdioHandler) ProcessTask(ctx context.Context, task Task) error {
 		return fmt.Errorf("failed to marshal task request: %w", err)
 	}
 
-	// Write request line (with newline)
+	// Write request line (with newline), guarded against closed pipe panic
 	h.logger.Debug("Sending task %s to child process", taskID)
 	reqLine := append(reqBytes, '\n')
-	if _, err := h.stdin.Write(reqLine); err != nil {
-		return fmt.Errorf("failed to write to stdin: %w", err)
+
+	h.mu.RLock()
+	closed := h.closed
+	doneCh := h.done // capture under lock to avoid race with Reconnect
+	h.mu.RUnlock()
+	if closed {
+		return fmt.Errorf("stdio handler is closed")
+	}
+
+	var writeErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				writeErr = fmt.Errorf("panic writing to stdin: %v", r)
+			}
+		}()
+		h.stdinMu.Lock()
+		_, writeErr = h.stdin.Write(reqLine)
+		h.stdinMu.Unlock()
+	}()
+	if writeErr != nil {
+		return fmt.Errorf("failed to write to stdin: %w", writeErr)
 	}
 
 	// Wait for response
@@ -160,7 +181,7 @@ func (h *StdioHandler) ProcessTask(ctx context.Context, task Task) error {
 	case <-ctx.Done():
 		return ctx.Err()
 
-	case <-h.done:
+	case <-doneCh:
 		return fmt.Errorf("handler stopped while waiting for response")
 	}
 }
@@ -187,6 +208,45 @@ func (h *StdioHandler) handleResponse(resp *StdioTaskResponse, task Task) error 
 	}
 
 	return nil
+}
+
+// Reconnect swaps the stdin/stdout pipes after a process restart.
+// It waits for the old readResponses goroutine to finish, fails all pending tasks,
+// then starts a new readResponses goroutine with the new pipes.
+func (h *StdioHandler) Reconnect(stdin io.Writer, stdout io.Reader) {
+	// Mark as closed first so ProcessTask() rejects new tasks during reconnect
+	h.mu.Lock()
+	h.closed = true
+	h.mu.Unlock()
+
+	// Wait for old readResponses to finish (it exits when stdout closes)
+	h.wg.Wait()
+
+	// Fail all pending tasks and swap pipes atomically
+	h.stdinMu.Lock()
+	h.mu.Lock()
+	// Close old done channel to wake up any ProcessTask selects
+	select {
+	case <-h.done:
+		// already closed
+	default:
+		close(h.done)
+	}
+	for taskID, ch := range h.pending {
+		close(ch)
+		delete(h.pending, taskID)
+	}
+	// Swap pipes and reset state — stdinMu held to sync with ProcessTask
+	h.stdin = stdin
+	h.stdout = stdout
+	h.closed = false
+	h.done = make(chan struct{})
+	h.mu.Unlock()
+	h.stdinMu.Unlock()
+
+	// Start new readResponses goroutine
+	h.wg.Add(1)
+	go h.readResponses()
 }
 
 // readResponses reads JSON lines from stdout and dispatches to pending tasks.
@@ -244,9 +304,10 @@ func (h *StdioHandler) readResponses() {
 	h.logger.Info("Stdout reader stopped")
 }
 
-// ReadySignal is sent by the child process to indicate it's ready.
+// ReadySignal is sent by the child process to indicate it's ready or has failed.
 type ReadySignal struct {
 	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
 }
 
 // WaitForReady waits for the child process to send a ready signal.
@@ -277,6 +338,10 @@ func WaitForReady(ctx context.Context, stdout io.Reader, logger Logger) error {
 
 			if signal.Status == "ready" {
 				close(readyCh)
+				return
+			}
+			if signal.Status == "error" {
+				errCh <- fmt.Errorf("process startup failed: %s", signal.Error)
 				return
 			}
 		}

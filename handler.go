@@ -124,6 +124,11 @@ func (h *StdioHandler) ProcessTask(ctx context.Context, task *Task) error {
 	return h.internal.ProcessTask(ctx, task)
 }
 
+// Reconnect swaps the stdin/stdout pipes after a process restart.
+func (h *StdioHandler) Reconnect(stdin io.Writer, stdout io.Reader) {
+	h.internal.Reconnect(stdin, stdout)
+}
+
 // OneShotHandler spawns a new process for each task.
 // The process handles one task and exits.
 type OneShotHandler struct {
