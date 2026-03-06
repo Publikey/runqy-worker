@@ -61,8 +61,9 @@ func (r *redisClient) dequeue(ctx context.Context, queues []string) (*Task, erro
 }
 
 // complete marks a task as completed and removes it from active queue.
-func (r *redisClient) complete(ctx context.Context, task *Task, queueName string) error {
-	return r.internal.Complete(ctx, task.id, queueName)
+// If ttl > 0, sets an expiry on the task hash key.
+func (r *redisClient) complete(ctx context.Context, task *Task, queueName string, ttl time.Duration) error {
+	return r.internal.Complete(ctx, task.id, queueName, ttl)
 }
 
 // retry re-queues a task for retry.
@@ -77,14 +78,15 @@ func (r *redisClient) retry(ctx context.Context, task *Task, queueName string, d
 }
 
 // fail marks a task as permanently failed.
-func (r *redisClient) fail(ctx context.Context, task *Task, queueName string, errMsg string) error {
+// If ttl > 0, sets an expiry on the task hash key.
+func (r *redisClient) fail(ctx context.Context, task *Task, queueName string, errMsg string, ttl time.Duration) error {
 	return r.internal.Fail(ctx, &redis.TaskData{
 		ID:       task.id,
 		Type:     task.typename,
 		Queue:    task.queue,
 		MaxRetry: task.maxRetry,
 		Retry:    task.retry,
-	}, queueName, errMsg)
+	}, queueName, errMsg, ttl)
 }
 
 // ping checks Redis connectivity.

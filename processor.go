@@ -259,7 +259,7 @@ func (p *processor) handleSuccess(ctx context.Context, task *Task, queueName str
 
 	if storeInRedis {
 		p.redisRetry("complete", task.id, func() error {
-			return p.redis.complete(ctx, task, queueName)
+			return p.redis.complete(ctx, task, queueName, p.config.CompletedTaskTTL)
 		})
 	} else {
 		// Just clean up the active queue without storing completion
@@ -288,7 +288,7 @@ func (p *processor) handleError(ctx context.Context, task *Task, queueName strin
 		p.logger.Warn(fmt.Sprintf("Task %s marked as permanent failure, skipping retry", task.id))
 		if storeInRedis {
 			p.redisRetry("fail", task.id, func() error {
-				return p.redis.fail(ctx, task, queueName, err.Error())
+				return p.redis.fail(ctx, task, queueName, err.Error(), p.config.CompletedTaskTTL)
 			})
 		} else {
 			p.redisRetry("cleanupActive", task.id, func() error {
@@ -321,7 +321,7 @@ func (p *processor) handleError(ctx context.Context, task *Task, queueName strin
 
 		if storeInRedis {
 			p.redisRetry("fail", task.id, func() error {
-				return p.redis.fail(ctx, task, queueName, err.Error())
+				return p.redis.fail(ctx, task, queueName, err.Error(), p.config.CompletedTaskTTL)
 			})
 		} else {
 			p.redisRetry("cleanupActive", task.id, func() error {

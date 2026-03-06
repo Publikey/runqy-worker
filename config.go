@@ -41,7 +41,8 @@ type Config struct {
 	RetryDelayFunc func(n int, err error, t *Task) time.Duration // Custom backoff (optional)
 
 	// Timeouts
-	ShutdownTimeout time.Duration // Time to wait for graceful shutdown (default: 8s)
+	ShutdownTimeout   time.Duration // Time to wait for graceful shutdown (default: 8s)
+	CompletedTaskTTL  time.Duration // TTL for completed/failed task keys in Redis (default: 24h, 0 = no expiry)
 
 	// Logger (optional, defaults to standard logger)
 	Logger Logger
@@ -73,7 +74,8 @@ func DefaultConfig() Config {
 		Concurrency:     1,
 		Queues:          map[string]int{"default": 1},
 		MaxRetry:        25,
-		ShutdownTimeout: 8 * time.Second,
+		ShutdownTimeout:  8 * time.Second,
+		CompletedTaskTTL: 24 * time.Hour,
 		Logger:          NewStdLogger(),
 		Recovery:        DefaultRecoveryConfig(),
 	}

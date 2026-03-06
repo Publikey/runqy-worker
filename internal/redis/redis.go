@@ -370,7 +370,8 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 
 // Complete marks a task as completed and removes it from active queue.
 // Results are already written to the task hash by TaskResultWriter.
-func (r *Client) Complete(ctx context.Context, taskID string, queueName string) error {
+// If ttl > 0, sets an expiry on the task hash key so it is automatically cleaned up.
+func (r *Client) Complete(ctx context.Context, taskID string, queueName string, ttl time.Duration) error {
 	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
 	leaseKey := fmt.Sprintf(KeyLease, queueName)
@@ -400,6 +401,11 @@ func (r *Client) Complete(ctx context.Context, taskID string, queueName string) 
 
 	// Add to completed sorted set with Unix timestamp as score
 	r.Rdb.ZAdd(ctx, completedKey, redis.Z{Score: float64(now), Member: taskID})
+
+	// Set TTL on the task hash key so completed tasks are automatically cleaned up
+	if ttl > 0 {
+		r.Rdb.Expire(ctx, taskKey, ttl)
+	}
 
 	return nil
 }
@@ -477,7 +483,8 @@ func (r *Client) Retry(ctx context.Context, task *TaskData, queueName string, de
 }
 
 // Fail marks a task as permanently failed (archived).
-func (r *Client) Fail(ctx context.Context, task *TaskData, queueName string, errMsg string) error {
+// If ttl > 0, sets an expiry on the task hash key so it is automatically cleaned up.
+func (r *Client) Fail(ctx context.Context, task *TaskData, queueName string, errMsg string, ttl time.Duration) error {
 	taskKey := fmt.Sprintf(KeyTask, queueName, task.ID)
 	activeKey := fmt.Sprintf(KeyActive, queueName)
 	leaseKey := fmt.Sprintf(KeyLease, queueName)
@@ -511,6 +518,11 @@ func (r *Client) Fail(ctx context.Context, task *TaskData, queueName string, err
 
 	// Add to archived sorted set with Unix timestamp as score
 	r.Rdb.ZAdd(ctx, archivedKey, redis.Z{Score: float64(now), Member: task.ID})
+
+	// Set TTL on the task hash key so archived tasks are automatically cleaned up
+	if ttl > 0 {
+		r.Rdb.Expire(ctx, taskKey, ttl)
+	}
 
 	return nil
 }

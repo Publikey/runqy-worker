@@ -93,10 +93,11 @@ type AuthConfig struct {
 
 // WorkerConfig holds worker settings from YAML.
 type WorkerConfig struct {
-	Queue           string   `yaml:"queue"`            // DEPRECATED: Single queue name (backward compat)
-	Queues          []string `yaml:"queues"`           // List of queue names to listen on
-	Concurrency     int      `yaml:"concurrency"`
-	ShutdownTimeout string   `yaml:"shutdown_timeout"`
+	Queue            string   `yaml:"queue"`              // DEPRECATED: Single queue name (backward compat)
+	Queues           []string `yaml:"queues"`             // List of queue names to listen on
+	Concurrency      int      `yaml:"concurrency"`
+	ShutdownTimeout  string   `yaml:"shutdown_timeout"`
+	CompletedTaskTTL string   `yaml:"completed_task_ttl"` // TTL for completed/failed task keys in Redis (default: 24h, "0" = no expiry)
 }
 
 // RetryConfig holds retry settings from YAML.
@@ -283,6 +284,11 @@ func toWorkerConfig(yc *YAMLConfig) Config {
 	if yc.Worker.ShutdownTimeout != "" {
 		if d, err := time.ParseDuration(yc.Worker.ShutdownTimeout); err == nil {
 			cfg.ShutdownTimeout = d
+		}
+	}
+	if yc.Worker.CompletedTaskTTL != "" {
+		if d, err := time.ParseDuration(yc.Worker.CompletedTaskTTL); err == nil {
+			cfg.CompletedTaskTTL = d
 		}
 	}
 
