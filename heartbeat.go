@@ -196,9 +196,12 @@ func (h *heartbeat) beat(ctx context.Context) {
 	healthy := h.isHealthy()
 
 	beatData := map[string]interface{}{
-		"last_beat": now,
-		"status":    h.getStatus(),
-		"healthy":   healthy,
+		"last_beat":   now,
+		"status":      h.getStatus(),
+		"healthy":     healthy,
+		"worker_id":   h.workerID,
+		"queues":      fmt.Sprintf("%v", h.config.Queues),
+		"concurrency": h.config.Concurrency,
 	}
 
 	// Attach system metrics
