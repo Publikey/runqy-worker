@@ -1,7 +1,7 @@
 # Inference-ready image with Python3, pip, virtualenv, and build tools
 # Supports workers that require compilation (llama-cpp-python, etc.)
 
-FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 ARG TARGETOS
 ARG TARGETARCH
