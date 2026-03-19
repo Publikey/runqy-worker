@@ -74,6 +74,16 @@ func DeployCode(ctx context.Context, config Config, spec DeploymentConfig, logge
 	}, nil
 }
 
+
+// gitEnv builds the environment variables for git operations (SSH key or token auth).
+func gitEnv(config Config, spec DeploymentConfig) []string {
+	if config.GitSSHKey != "" {
+		sshCmd := fmt.Sprintf("ssh -i %s -o StrictHostKeyChecking=no", config.GitSSHKey)
+		return append(os.Environ(), "GIT_SSH_COMMAND="+sshCmd)
+	}
+	return os.Environ()
+}
+
 // gitClone clones the repository or reuses existing deployment.
 // If spec.CodePath is set, uses sparse checkout to only download that subdirectory.
 func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, config Config, logger Logger) (string, error) {
@@ -83,7 +93,20 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 		// Directory exists - check for .git
 		gitDir := filepath.Join(deployDir, ".git")
 		if _, err := os.Stat(gitDir); err == nil {
-			logger.Info("Using existing deployment at %s", deployDir)
+			logger.Info("Existing deployment found at %s, pulling latest changes...", deployDir)
+
+			// Pull latest changes to ensure worker runs up-to-date code
+			pullArgs := []string{"pull", "--ff-only"}
+			pullCmd := exec.CommandContext(ctx, "git", pullArgs...)
+			pullCmd.Dir = deployDir
+			pullCmd.Env = gitEnv(config, spec)
+
+			if pullOutput, pullErr := pullCmd.CombinedOutput(); pullErr != nil {
+				logger.Warn("Git pull failed (continuing with existing code): %v\nOutput: %s", pullErr, string(pullOutput))
+			} else {
+				logger.Info("Git pull successful")
+			}
+
 			return deployDir, nil
 		}
 		// Directory exists but no .git - error
