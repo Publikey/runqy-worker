@@ -107,9 +107,13 @@ func (r *redisReconnector) handleError(err error) bool {
 
 	// Trigger reconnection on first connection error - no reason to wait
 	if r.consecutiveErrs >= 1 {
-		// Rate limit: max once per 5 seconds
-		if time.Since(r.lastReconnect) < 5*time.Second {
-			r.logger.Warn("Redis reconnection rate-limited (last attempt was %v ago)", time.Since(r.lastReconnect))
+		// Exponential backoff: 5s, 10s, 20s, 40s, 80s
+		backoff := time.Duration(5<<r.reconnectFails) * time.Second // 5s, 10s, 20s, 40s, 80s
+		if backoff > 80*time.Second {
+			backoff = 80 * time.Second
+		}
+		if time.Since(r.lastReconnect) < backoff {
+			r.logger.Warn("Redis reconnection rate-limited (backoff %v, last attempt was %v ago)", backoff, time.Since(r.lastReconnect))
 			return false
 		}
 
