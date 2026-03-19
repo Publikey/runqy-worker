@@ -3,12 +3,18 @@ package worker
 import (
 	"context"
 	"crypto/tls"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// MaxReconnectFailures is the number of consecutive failed reconnection attempts
+// before the worker exits. This allows the container orchestrator (Docker, k8s)
+// to restart the process cleanly.
+const MaxReconnectFailures = 5
 
 // RedisConnConfig holds the configuration needed to create a Redis connection.
 // This is stored during bootstrap so we can recreate the connection if needed.
@@ -25,6 +31,7 @@ type redisReconnector struct {
 	config          RedisConnConfig
 	currentClient   *redis.Client
 	consecutiveErrs int
+	reconnectFails  int
 	lastReconnect   time.Time
 	logger          Logger
 
@@ -69,9 +76,10 @@ func isConnectionError(err error) bool {
 		"network is unreachable",
 		"host is down",
 		"no route to host",
-		"wsarecv",      // Windows socket errors
-		"wsasend",      // Windows socket errors
+		"wsarecv",         // Windows socket errors
+		"wsasend",         // Windows socket errors
 		"forcibly closed", // Windows: "An existing connection was forcibly closed"
+		"client is closed", // go-redis: client.Close() was called or client was shut down
 	}
 
 	for _, pattern := range connectionPatterns {
@@ -106,7 +114,20 @@ func (r *redisReconnector) handleError(err error) bool {
 		}
 
 		r.logger.Warn("Attempting Redis reconnection...")
-		return r.reconnectLocked()
+		if r.reconnectLocked() {
+			r.reconnectFails = 0
+			return true
+		}
+
+		r.reconnectFails++
+		r.logger.Error("Redis reconnection failed (%d/%d)", r.reconnectFails, MaxReconnectFailures)
+
+		if r.reconnectFails >= MaxReconnectFailures {
+			r.logger.Error("Max reconnection failures reached (%d). Exiting to allow container restart.", MaxReconnectFailures)
+			os.Exit(1)
+		}
+
+		return false
 	}
 
 	return false
