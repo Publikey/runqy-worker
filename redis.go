@@ -89,6 +89,11 @@ func (r *redisClient) fail(ctx context.Context, task *Task, queueName string, er
 	}, queueName, errMsg, ttl)
 }
 
+// forwardReady moves tasks from retry sorted sets to pending for the given queues.
+func (r *redisClient) forwardReady(ctx context.Context, queues []string) (int, error) {
+	return r.internal.ForwardReady(ctx, queues)
+}
+
 // ping checks Redis connectivity.
 func (r *redisClient) ping(ctx context.Context) error {
 	return r.internal.Ping(ctx)

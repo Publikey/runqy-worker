@@ -451,28 +451,10 @@ func (r *Client) Retry(ctx context.Context, task *TaskData, queueName string, de
 	)
 
 	if delay > 0 {
-		// Add to retry sorted set with scheduled time as score
+		// Add to retry sorted set with scheduled time as score.
+		// The retryForwarder will move it to pending when the time comes.
 		retryAt := float64(now.Add(delay).Unix())
 		r.Rdb.ZAdd(ctx, retryKey, redis.Z{Score: retryAt, Member: task.ID})
-
-		// Start a goroutine to move the task from retry to pending when ready.
-		// Use the caller's context so goroutine is cancelled at shutdown.
-		go func() {
-			timer := time.NewTimer(delay)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-				// Move from retry to pending
-				moveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				r.Rdb.ZRem(moveCtx, retryKey, task.ID)
-				r.Rdb.LPush(moveCtx, pendingKey, task.ID)
-				r.Rdb.HSet(moveCtx, taskKey, FieldState, StatePending)
-			case <-ctx.Done():
-				// Shutdown — leave task in retry set for next worker pickup
-				r.Logger.Info("Retry goroutine cancelled for task %s (shutdown)", task.ID)
-			}
-		}()
 	} else {
 		// No delay, push directly to pending
 		r.Rdb.LPush(ctx, pendingKey, task.ID)
@@ -480,6 +462,65 @@ func (r *Client) Retry(ctx context.Context, task *TaskData, queueName string, de
 	}
 
 	return nil
+}
+
+// ForwardReady moves tasks from the retry sorted set to pending for each queue.
+// It scans for tasks whose retry time (score) has passed and atomically moves them.
+// Returns the total number of tasks forwarded.
+func (r *Client) ForwardReady(ctx context.Context, queues []string) (int, error) {
+	now := float64(time.Now().Unix())
+	total := 0
+
+	// Deduplicate queue names (buildQueueList may repeat queues for weighting)
+	seen := make(map[string]bool, len(queues))
+	for _, q := range queues {
+		if seen[q] {
+			continue
+		}
+		seen[q] = true
+
+		retryKey := fmt.Sprintf(KeyRetry, q)
+		pendingKey := fmt.Sprintf(KeyPending, q)
+
+		// Get all tasks whose score (retry time) <= now
+		tasks, err := r.Rdb.ZRangeByScore(ctx, retryKey, &redis.ZRangeBy{
+			Min: "-inf",
+			Max: fmt.Sprintf("%v", now),
+		}).Result()
+		if err != nil {
+			r.Logger.Error("ForwardReady: failed to scan retry set for queue %s: %v", q, err)
+			continue
+		}
+
+		for _, taskID := range tasks {
+			taskKey := fmt.Sprintf(KeyTask, q, taskID)
+
+			// Atomically: remove from retry, push to pending, update state
+			forwardScript := redis.NewScript(`
+				local removed = redis.call("ZREM", KEYS[1], ARGV[1])
+				if removed == 1 then
+					redis.call("LPUSH", KEYS[2], ARGV[1])
+					redis.call("HSET", KEYS[3], "state", ARGV[2], "pending_since", ARGV[3])
+					return 1
+				end
+				return 0
+			`)
+			result, err := forwardScript.Run(ctx, r.Rdb,
+				[]string{retryKey, pendingKey, taskKey},
+				taskID, StatePending, time.Now().Unix(),
+			).Int()
+			if err != nil {
+				r.Logger.Error("ForwardReady: failed to forward task %s: %v", taskID, err)
+				continue
+			}
+			if result == 1 {
+				total++
+				r.Logger.Info("ForwardReady: moved task %s from retry to pending (queue=%s)", taskID, q)
+			}
+		}
+	}
+
+	return total, nil
 }
 
 // Fail marks a task as permanently failed (archived).

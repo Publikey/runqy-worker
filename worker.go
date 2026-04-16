@@ -38,6 +38,7 @@ type Worker struct {
 	mux           *ServeMux
 	processor     *processor
 	heartbeat     *heartbeat
+	forwarder     *retryForwarder
 	reconnector   *redisReconnector
 	queueHandlers map[string]HandlerFunc // stored until processor is created
 
@@ -636,6 +637,9 @@ func (w *Worker) Run() error {
 		w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates, "running")
 	}
 
+	// Create retry forwarder — scans retry sorted sets and moves ready tasks to pending
+	w.forwarder = newRetryForwarder(redisClient, &w.processor.redisMu, w.processor.queues, 5*time.Second, w.logger)
+
 	// Set queue states for per-queue health checks
 	w.processor.SetQueueStates(w.queueStates)
 
@@ -652,6 +656,8 @@ func (w *Worker) Run() error {
 			w.rdb = client
 			w.heartbeat.updateClient(client)
 			w.processor.updateClient(client, w.logger)
+			// Update forwarder's redis client under the shared lock
+			w.forwarder.updateClient(newRedisClient(client, w.logger))
 		})
 		w.processor.SetReconnector(w.reconnector)
 	} else {
@@ -663,6 +669,7 @@ func (w *Worker) Run() error {
 		w.heartbeat.start()
 	}
 	w.processor.start()
+	w.forwarder.start()
 
 	w.logger.Info("Worker running. Press Ctrl+C to stop.")
 
@@ -714,6 +721,9 @@ func (w *Worker) Start(ctx context.Context) error {
 		w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates, "running")
 	}
 
+	// Create retry forwarder — scans retry sorted sets and moves ready tasks to pending
+	w.forwarder = newRetryForwarder(redisClient, &w.processor.redisMu, w.processor.queues, 5*time.Second, w.logger)
+
 	// Set queue states for per-queue health checks
 	w.processor.SetQueueStates(w.queueStates)
 
@@ -730,6 +740,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			w.rdb = client
 			w.heartbeat.updateClient(client)
 			w.processor.updateClient(client, w.logger)
+			w.forwarder.updateClient(newRedisClient(client, w.logger))
 		})
 		w.processor.SetReconnector(w.reconnector)
 	} else {
@@ -741,6 +752,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		w.heartbeat.start()
 	}
 	w.processor.start()
+	w.forwarder.start()
 
 	w.logger.Info("Worker running.")
 
@@ -767,6 +779,11 @@ func (w *Worker) Shutdown() {
 
 // shutdown performs the actual shutdown sequence.
 func (w *Worker) shutdown() error {
+	w.logger.Info("Stopping retry forwarder...")
+	if w.forwarder != nil {
+		w.forwarder.stop()
+	}
+
 	w.logger.Info("Stopping processor...")
 	if w.processor != nil {
 		w.processor.stop()
