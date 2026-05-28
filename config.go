@@ -44,6 +44,13 @@ type Config struct {
 	ShutdownTimeout   time.Duration // Time to wait for graceful shutdown (default: 8s)
 	CompletedTaskTTL  time.Duration // TTL for completed/failed task keys in Redis (default: 24h, 0 = no expiry)
 
+	// Lease settings
+	// A task's lease is set at dequeue and periodically renewed by the worker while it
+	// is being processed. If the worker dies, the lease expires and the lease recoverer
+	// reclaims the task. LeaseDuration must be comfortably larger than LeaseExtendInterval.
+	LeaseDuration       time.Duration // How long a lease is valid before it must be renewed (default: 2m)
+	LeaseExtendInterval time.Duration // How often in-flight leases are renewed (default: LeaseDuration/2)
+
 	// Logger (optional, defaults to standard logger)
 	Logger Logger
 
@@ -76,6 +83,11 @@ func DefaultConfig() Config {
 		MaxRetry:        25,
 		ShutdownTimeout:  8 * time.Second,
 		CompletedTaskTTL: 24 * time.Hour,
+
+		// Lease defaults
+		LeaseDuration:       2 * time.Minute,
+		LeaseExtendInterval: 1 * time.Minute,
+
 		Logger:          NewStdLogger(),
 		Recovery:        DefaultRecoveryConfig(),
 	}

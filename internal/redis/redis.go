@@ -256,8 +256,10 @@ func appendVarint(buf []byte, val uint64) []byte {
 
 // Dequeue attempts to dequeue a task from the given queues using BRPOP.
 // This is compatible with asynq's list-based pending queue.
+// leaseDuration sets how long the task's lease is valid before it must be
+// renewed (see ExtendLease); the worker renews it periodically while processing.
 // Returns nil if no task is available.
-func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error) {
+func (r *Client) Dequeue(ctx context.Context, queues []string, leaseDuration time.Duration) (*TaskData, error) {
 	// Build list of pending queue keys
 	keys := make([]string, len(queues))
 	for i, q := range queues {
@@ -334,7 +336,10 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 	// Atomically: move task to active queue, add to lease tracking, update state
 	activeKey := fmt.Sprintf(KeyActive, queueName)
 	leaseKey := fmt.Sprintf(KeyLease, queueName)
-	leaseExpiration := float64(time.Now().Add(30 * time.Minute).Unix())
+	if leaseDuration <= 0 {
+		leaseDuration = 2 * time.Minute
+	}
+	leaseExpiration := float64(time.Now().Add(leaseDuration).Unix())
 
 	activateScript := redis.NewScript(`
 		redis.call("LPUSH", KEYS[1], ARGV[1])
@@ -347,12 +352,12 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 		[]string{activeKey, leaseKey, taskKey},
 		taskID, leaseExpiration, StateActive,
 	).Err(); err != nil {
-		r.Logger.Error("Lua activate script failed for task %s, falling back to non-atomic: %v", taskID, err)
-		// Fallback to non-atomic operations
-		r.Rdb.LPush(ctx, activeKey, taskID)
-		r.Rdb.ZAdd(ctx, leaseKey, redis.Z{Score: leaseExpiration, Member: taskID})
-		r.Rdb.HSet(ctx, taskKey, FieldState, StateActive)
-		r.Rdb.HDel(ctx, taskKey, FieldPendingSince)
+		r.Logger.Error("Lua activate script failed for task %s, returning to pending: %v", taskID, err)
+		// Push back to pending so another worker (or this one) can pick it up.
+		// Do NOT push to active — that would risk duplicates.
+		pendingKey := fmt.Sprintf(KeyPending, queueName)
+		r.Rdb.RPush(ctx, pendingKey, taskID)
+		return nil, fmt.Errorf("activate script failed for task %s: %w", taskID, err)
 	}
 
 	taskData := &TaskData{
@@ -368,6 +373,20 @@ func (r *Client) Dequeue(ctx context.Context, queues []string) (*TaskData, error
 	return taskData, nil
 }
 
+// completeCmd atomically removes a task from active/lease and marks it as completed.
+// KEYS[1] = activeKey, KEYS[2] = leaseKey, KEYS[3] = completedKey, KEYS[4] = taskKey
+// ARGV[1] = taskID, ARGV[2] = now (unix), ARGV[3] = state, ARGV[4] = ttl (seconds, 0 = no expiry)
+var completeCmd = redis.NewScript(`
+redis.call("LREM", KEYS[1], 0, ARGV[1])
+redis.call("ZREM", KEYS[2], ARGV[1])
+redis.call("ZADD", KEYS[3], ARGV[2], ARGV[1])
+redis.call("HSET", KEYS[4], "state", ARGV[3], "completed_at", ARGV[2])
+if tonumber(ARGV[4]) > 0 then
+    redis.call("EXPIRE", KEYS[4], ARGV[4])
+end
+return 1
+`)
+
 // Complete marks a task as completed and removes it from active queue.
 // Results are already written to the task hash by TaskResultWriter.
 // If ttl > 0, sets an expiry on the task hash key so it is automatically cleaned up.
@@ -379,13 +398,8 @@ func (r *Client) Complete(ctx context.Context, taskID string, queueName string, 
 
 	now := time.Now().Unix()
 
-	// Remove from active queue (List) and lease tracking (Sorted Set)
-	r.Rdb.LRem(ctx, activeKey, 1, taskID)
-	r.Rdb.ZRem(ctx, leaseKey, taskID)
-
-	// Update the protobuf msg field with completed_at timestamp (for asynq inspector compatibility).
-	// Append field 13 (completed_at, varint) to the existing protobuf blob.
-	// Protobuf allows appending fields — the last value for a scalar field wins.
+	// Best-effort: update protobuf msg field with completed_at timestamp (for asynq inspector compatibility).
+	// This is non-critical; the hash fields are authoritative.
 	if msgData, err := r.Rdb.HGet(ctx, taskKey, FieldMsg).Result(); err == nil {
 		var extra []byte
 		extra = append(extra, (13<<3)|0) // field 13, wire type 0 (varint)
@@ -393,22 +407,44 @@ func (r *Client) Complete(ctx context.Context, taskID string, queueName string, 
 		r.Rdb.HSet(ctx, taskKey, FieldMsg, string(append([]byte(msgData), extra...)))
 	}
 
-	// Update task hash: state and completed_at
-	r.Rdb.HSet(ctx, taskKey,
-		FieldState, StateCompleted,
-		FieldCompletedAt, now,
-	)
-
-	// Add to completed sorted set with Unix timestamp as score
-	r.Rdb.ZAdd(ctx, completedKey, redis.Z{Score: float64(now), Member: taskID})
-
-	// Set TTL on the task hash key so completed tasks are automatically cleaned up
+	// Atomic: remove from active + lease, add to completed, update state
+	ttlSecs := int64(0)
 	if ttl > 0 {
-		r.Rdb.Expire(ctx, taskKey, ttl)
+		ttlSecs = int64(ttl.Seconds())
+	}
+	if err := completeCmd.Run(ctx, r.Rdb,
+		[]string{activeKey, leaseKey, completedKey, taskKey},
+		taskID, now, StateCompleted, ttlSecs,
+	).Err(); err != nil {
+		return fmt.Errorf("complete script failed for task %s: %w", taskID, err)
 	}
 
 	return nil
 }
+
+// retryWithDelayCmd atomically removes from active/lease, adds to retry sorted set.
+// KEYS[1] = activeKey, KEYS[2] = leaseKey, KEYS[3] = retryKey, KEYS[4] = taskKey
+// ARGV[1] = taskID, ARGV[2] = retryAt (unix), ARGV[3] = now (unix)
+var retryWithDelayCmd = redis.NewScript(`
+redis.call("LREM", KEYS[1], 0, ARGV[1])
+redis.call("ZREM", KEYS[2], ARGV[1])
+redis.call("ZADD", KEYS[3], ARGV[2], ARGV[1])
+redis.call("HINCRBY", KEYS[4], "retried", 1)
+redis.call("HSET", KEYS[4], "state", "retry", "last_failed_at", ARGV[3])
+return 1
+`)
+
+// retryImmediateCmd atomically removes from active/lease, pushes directly to pending.
+// KEYS[1] = activeKey, KEYS[2] = leaseKey, KEYS[3] = pendingKey, KEYS[4] = taskKey
+// ARGV[1] = taskID, ARGV[2] = now (unix)
+var retryImmediateCmd = redis.NewScript(`
+redis.call("LREM", KEYS[1], 0, ARGV[1])
+redis.call("ZREM", KEYS[2], ARGV[1])
+redis.call("LPUSH", KEYS[3], ARGV[1])
+redis.call("HINCRBY", KEYS[4], "retried", 1)
+redis.call("HSET", KEYS[4], "state", "pending", "last_failed_at", ARGV[2])
+return 1
+`)
 
 // Retry re-queues a task for retry using the retry sorted set.
 func (r *Client) Retry(ctx context.Context, task *TaskData, queueName string, delay time.Duration) error {
@@ -420,12 +456,7 @@ func (r *Client) Retry(ctx context.Context, task *TaskData, queueName string, de
 
 	now := time.Now()
 
-	// Remove from active queue (List) and lease tracking (Sorted Set)
-	r.Rdb.LRem(ctx, activeKey, 1, task.ID)
-	r.Rdb.ZRem(ctx, leaseKey, task.ID)
-
-	// Update the protobuf msg field with incremented retry count (for asynqmon compatibility).
-	// If the msg field is missing, create it from the task data.
+	// Best-effort: update protobuf msg field with incremented retry count (for asynqmon compatibility).
 	if msgData, err := r.Rdb.HGet(ctx, taskKey, FieldMsg).Result(); err == nil {
 		if asynqMsg, err := parseAsynqMessage([]byte(msgData)); err == nil {
 			asynqMsg.Retried++
@@ -443,22 +474,22 @@ func (r *Client) Retry(ctx context.Context, task *TaskData, queueName string, de
 		r.Rdb.HSet(ctx, taskKey, FieldMsg, string(msg))
 	}
 
-	// Increment retry count in hash field and update state
-	r.Rdb.HIncrBy(ctx, taskKey, FieldRetried, 1)
-	r.Rdb.HSet(ctx, taskKey,
-		FieldState, StateRetry,
-		FieldLastFailedAt, now.Unix(),
-	)
-
+	// Atomic: remove from active + lease, move to retry or pending
 	if delay > 0 {
-		// Add to retry sorted set with scheduled time as score.
-		// The retryForwarder will move it to pending when the time comes.
 		retryAt := float64(now.Add(delay).Unix())
-		r.Rdb.ZAdd(ctx, retryKey, redis.Z{Score: retryAt, Member: task.ID})
+		if err := retryWithDelayCmd.Run(ctx, r.Rdb,
+			[]string{activeKey, leaseKey, retryKey, taskKey},
+			task.ID, retryAt, now.Unix(),
+		).Err(); err != nil {
+			return fmt.Errorf("retry script failed for task %s: %w", task.ID, err)
+		}
 	} else {
-		// No delay, push directly to pending
-		r.Rdb.LPush(ctx, pendingKey, task.ID)
-		r.Rdb.HSet(ctx, taskKey, FieldState, StatePending)
+		if err := retryImmediateCmd.Run(ctx, r.Rdb,
+			[]string{activeKey, leaseKey, pendingKey, taskKey},
+			task.ID, now.Unix(),
+		).Err(); err != nil {
+			return fmt.Errorf("retry-immediate script failed for task %s: %w", task.ID, err)
+		}
 	}
 
 	return nil
@@ -523,6 +554,20 @@ func (r *Client) ForwardReady(ctx context.Context, queues []string) (int, error)
 	return total, nil
 }
 
+// failCmd atomically removes from active/lease and archives a task.
+// KEYS[1] = activeKey, KEYS[2] = leaseKey, KEYS[3] = archivedKey, KEYS[4] = taskKey
+// ARGV[1] = taskID, ARGV[2] = now (unix), ARGV[3] = errMsg, ARGV[4] = ttl (seconds, 0 = no expiry)
+var failCmd = redis.NewScript(`
+redis.call("LREM", KEYS[1], 0, ARGV[1])
+redis.call("ZREM", KEYS[2], ARGV[1])
+redis.call("ZADD", KEYS[3], ARGV[2], ARGV[1])
+redis.call("HSET", KEYS[4], "state", "archived", "error_msg", ARGV[3], "last_failed_at", ARGV[2])
+if tonumber(ARGV[4]) > 0 then
+    redis.call("EXPIRE", KEYS[4], ARGV[4])
+end
+return 1
+`)
+
 // Fail marks a task as permanently failed (archived).
 // If ttl > 0, sets an expiry on the task hash key so it is automatically cleaned up.
 func (r *Client) Fail(ctx context.Context, task *TaskData, queueName string, errMsg string, ttl time.Duration) error {
@@ -533,12 +578,7 @@ func (r *Client) Fail(ctx context.Context, task *TaskData, queueName string, err
 
 	now := time.Now().Unix()
 
-	// Remove from active queue (List) and lease tracking (Sorted Set)
-	r.Rdb.LRem(ctx, activeKey, 1, task.ID)
-	r.Rdb.ZRem(ctx, leaseKey, task.ID)
-
-	// Ensure the msg protobuf field exists for asynq inspector compatibility.
-	// If missing, create it from the task data we have.
+	// Best-effort: ensure protobuf msg field exists for asynq inspector compatibility.
 	if exists, _ := r.Rdb.HExists(ctx, taskKey, FieldMsg).Result(); !exists {
 		msg := encodeAsynqMessage(&asynqTaskMessage{
 			Type:     task.Type,
@@ -550,19 +590,16 @@ func (r *Client) Fail(ctx context.Context, task *TaskData, queueName string, err
 		r.Rdb.HSet(ctx, taskKey, FieldMsg, string(msg))
 	}
 
-	// Update task hash: state, error message, and last failed timestamp
-	r.Rdb.HSet(ctx, taskKey,
-		FieldState, StateArchived,
-		FieldErrorMsg, errMsg,
-		FieldLastFailedAt, now,
-	)
-
-	// Add to archived sorted set with Unix timestamp as score
-	r.Rdb.ZAdd(ctx, archivedKey, redis.Z{Score: float64(now), Member: task.ID})
-
-	// Set TTL on the task hash key so archived tasks are automatically cleaned up
+	// Atomic: remove from active + lease, add to archived, update state
+	ttlSecs := int64(0)
 	if ttl > 0 {
-		r.Rdb.Expire(ctx, taskKey, ttl)
+		ttlSecs = int64(ttl.Seconds())
+	}
+	if err := failCmd.Run(ctx, r.Rdb,
+		[]string{activeKey, leaseKey, archivedKey, taskKey},
+		task.ID, now, errMsg, ttlSecs,
+	).Err(); err != nil {
+		return fmt.Errorf("fail script failed for task %s: %w", task.ID, err)
 	}
 
 	return nil
@@ -578,6 +615,16 @@ func (r *Client) GetRedisClient() *redis.Client {
 	return r.Rdb
 }
 
+// cleanupActiveCmd atomically removes from active/lease and deletes the task hash.
+// KEYS[1] = activeKey, KEYS[2] = leaseKey, KEYS[3] = taskKey
+// ARGV[1] = taskID
+var cleanupActiveCmd = redis.NewScript(`
+redis.call("LREM", KEYS[1], 0, ARGV[1])
+redis.call("ZREM", KEYS[2], ARGV[1])
+redis.call("DEL", KEYS[3])
+return 1
+`)
+
 // CleanupActive removes a task from active queue without storing completion data.
 // Used when redis_storage is disabled.
 func (r *Client) CleanupActive(ctx context.Context, taskID string, queueName string) error {
@@ -585,12 +632,12 @@ func (r *Client) CleanupActive(ctx context.Context, taskID string, queueName str
 	activeKey := fmt.Sprintf(KeyActive, queueName)
 	leaseKey := fmt.Sprintf(KeyLease, queueName)
 
-	// Remove from active queue (List) and lease tracking (Sorted Set)
-	r.Rdb.LRem(ctx, activeKey, 1, taskID)
-	r.Rdb.ZRem(ctx, leaseKey, taskID)
-
-	// Delete the task hash entirely
-	r.Rdb.Del(ctx, taskKey)
+	if err := cleanupActiveCmd.Run(ctx, r.Rdb,
+		[]string{activeKey, leaseKey, taskKey},
+		taskID,
+	).Err(); err != nil {
+		return fmt.Errorf("cleanup-active script failed for task %s: %w", taskID, err)
+	}
 
 	return nil
 }
@@ -617,4 +664,194 @@ func (r *Client) IncrementFailed(ctx context.Context, queueName string) error {
 	pipe.Incr(ctx, dailyKey)
 	_, err := pipe.Exec(ctx)
 	return err
+}
+
+// --- Lease recovery methods ---
+
+// ListLeaseExpired returns task IDs with expired leases for a given queue.
+// cutoff is the time threshold: tasks with lease score <= cutoff are considered expired.
+func (r *Client) ListLeaseExpired(ctx context.Context, queueName string, cutoff time.Time) ([]*TaskData, error) {
+	leaseKey := fmt.Sprintf(KeyLease, queueName)
+
+	ids, err := r.Rdb.ZRangeByScore(ctx, leaseKey, &redis.ZRangeBy{
+		Min: "-inf",
+		Max: fmt.Sprintf("%d", cutoff.Unix()),
+	}).Result()
+	if err != nil {
+		return nil, fmt.Errorf("zrangebyscore failed for lease key %s: %w", leaseKey, err)
+	}
+
+	var tasks []*TaskData
+	for _, taskID := range ids {
+		taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
+		data, err := r.Rdb.HGetAll(ctx, taskKey).Result()
+		if err != nil || len(data) == 0 {
+			// Orphaned lease entry — task hash deleted. Return with zero MaxRetry so recoverer archives it.
+			tasks = append(tasks, &TaskData{
+				ID:      taskID,
+				Queue:   queueName,
+				TaskKey: taskKey,
+			})
+			continue
+		}
+
+		// Parse task data
+		var maxRetry, retried int
+		var taskType string
+		if msgData, ok := data[FieldMsg]; ok {
+			if asynqMsg, err := parseAsynqMessage([]byte(msgData)); err == nil {
+				taskType = asynqMsg.Type
+				maxRetry = asynqMsg.MaxRetry
+				retried = asynqMsg.Retried
+			}
+		}
+		// Hash field overrides protobuf for retried count
+		if retriedStr, ok := data[FieldRetried]; ok {
+			var hashRetried int
+			if _, err := fmt.Sscanf(retriedStr, "%d", &hashRetried); err == nil && hashRetried > retried {
+				retried = hashRetried
+			}
+		}
+
+		tasks = append(tasks, &TaskData{
+			ID:       taskID,
+			Type:     taskType,
+			Retry:    retried,
+			MaxRetry: maxRetry,
+			Queue:    queueName,
+			TaskKey:  taskKey,
+		})
+	}
+
+	return tasks, nil
+}
+
+// recoverToRetryCmd atomically removes from active/lease and adds to retry sorted set.
+var recoverToRetryCmd = redis.NewScript(`
+redis.call("LREM", KEYS[1], 0, ARGV[1])
+redis.call("ZREM", KEYS[2], ARGV[1])
+redis.call("ZADD", KEYS[3], ARGV[2], ARGV[1])
+redis.call("HINCRBY", KEYS[4], "retried", 1)
+redis.call("HSET", KEYS[4], "state", "retry", "error_msg", "lease expired", "last_failed_at", ARGV[3])
+return 1
+`)
+
+// RecoverToRetry moves an expired-lease task from active to retry with a delay.
+func (r *Client) RecoverToRetry(ctx context.Context, task *TaskData, queueName string, delay time.Duration) error {
+	activeKey := fmt.Sprintf(KeyActive, queueName)
+	leaseKey := fmt.Sprintf(KeyLease, queueName)
+	retryKey := fmt.Sprintf(KeyRetry, queueName)
+	taskKey := fmt.Sprintf(KeyTask, queueName, task.ID)
+
+	now := time.Now()
+	retryAt := float64(now.Add(delay).Unix())
+
+	if err := recoverToRetryCmd.Run(ctx, r.Rdb,
+		[]string{activeKey, leaseKey, retryKey, taskKey},
+		task.ID, retryAt, now.Unix(),
+	).Err(); err != nil {
+		return fmt.Errorf("recover-to-retry script failed for task %s: %w", task.ID, err)
+	}
+	return nil
+}
+
+// recoverToArchiveCmd atomically removes from active/lease and archives a task.
+var recoverToArchiveCmd = redis.NewScript(`
+redis.call("LREM", KEYS[1], 0, ARGV[1])
+redis.call("ZREM", KEYS[2], ARGV[1])
+redis.call("ZADD", KEYS[3], ARGV[2], ARGV[1])
+redis.call("HSET", KEYS[4], "state", "archived", "error_msg", "lease expired: max retries exceeded", "last_failed_at", ARGV[2])
+return 1
+`)
+
+// RecoverToArchive moves an expired-lease task from active to archived.
+func (r *Client) RecoverToArchive(ctx context.Context, task *TaskData, queueName string) error {
+	activeKey := fmt.Sprintf(KeyActive, queueName)
+	leaseKey := fmt.Sprintf(KeyLease, queueName)
+	archivedKey := fmt.Sprintf(KeyArchived, queueName)
+	taskKey := fmt.Sprintf(KeyTask, queueName, task.ID)
+
+	now := time.Now().Unix()
+
+	if err := recoverToArchiveCmd.Run(ctx, r.Rdb,
+		[]string{activeKey, leaseKey, archivedKey, taskKey},
+		task.ID, now,
+	).Err(); err != nil {
+		return fmt.Errorf("recover-to-archive script failed for task %s: %w", task.ID, err)
+	}
+	return nil
+}
+
+// recoverOrphanedCmd removes orphaned entries from active list and lease set (no task hash to update).
+var recoverOrphanedCmd = redis.NewScript(`
+redis.call("LREM", KEYS[1], 0, ARGV[1])
+redis.call("ZREM", KEYS[2], ARGV[1])
+return 1
+`)
+
+// RecoverOrphaned removes an orphaned task (no hash data) from active and lease.
+func (r *Client) RecoverOrphaned(ctx context.Context, taskID string, queueName string) error {
+	activeKey := fmt.Sprintf(KeyActive, queueName)
+	leaseKey := fmt.Sprintf(KeyLease, queueName)
+
+	if err := recoverOrphanedCmd.Run(ctx, r.Rdb,
+		[]string{activeKey, leaseKey},
+		taskID,
+	).Err(); err != nil {
+		return fmt.Errorf("recover-orphaned script failed for task %s: %w", taskID, err)
+	}
+	return nil
+}
+
+// ExtendLease renews the lease of an in-flight task, pushing its expiration to
+// now+leaseDuration. It uses ZADD with XX so a task whose lease was already
+// removed (e.g. it just completed) is NOT re-added — this avoids resurrecting a
+// finished task's lease entry. Safe to call on the shared per-sub-queue lease key
+// from multiple workers, since each only extends its own task IDs.
+func (r *Client) ExtendLease(ctx context.Context, taskID, queueName string, leaseDuration time.Duration) error {
+	if leaseDuration <= 0 {
+		leaseDuration = 2 * time.Minute
+	}
+	leaseKey := fmt.Sprintf(KeyLease, queueName)
+	expiration := float64(time.Now().Add(leaseDuration).Unix())
+	if err := r.Rdb.ZAddArgs(ctx, leaseKey, redis.ZAddArgs{
+		XX:      true,
+		Members: []redis.Z{{Score: expiration, Member: taskID}},
+	}).Err(); err != nil {
+		return fmt.Errorf("extend-lease failed for task %s: %w", taskID, err)
+	}
+	return nil
+}
+
+// requeueActiveCmd moves a SINGLE task from active back to pending, but only if it
+// is actually still in the active list. It never touches other tasks, so it is safe
+// on the shared per-sub-queue active/lease keys when multiple workers run.
+// Returns the number of entries removed from active (0 if the task was no longer active).
+var requeueActiveCmd = redis.NewScript(`
+local removed = redis.call("LREM", KEYS[1], 0, ARGV[1])
+if removed > 0 then
+    redis.call("ZREM", KEYS[2], ARGV[1])
+    redis.call("LPUSH", KEYS[3], ARGV[1])
+    redis.call("HSET", KEYS[4], "state", "pending")
+end
+return removed
+`)
+
+// RequeueActive moves one task from the active list back to pending (and clears its
+// lease) if it is still active. Used on graceful shutdown to requeue this worker's
+// own in-flight tasks without disturbing tasks owned by other workers.
+func (r *Client) RequeueActive(ctx context.Context, taskID, queueName string) (int, error) {
+	activeKey := fmt.Sprintf(KeyActive, queueName)
+	leaseKey := fmt.Sprintf(KeyLease, queueName)
+	pendingKey := fmt.Sprintf(KeyPending, queueName)
+	taskKey := fmt.Sprintf(KeyTask, queueName, taskID)
+
+	removed, err := requeueActiveCmd.Run(ctx, r.Rdb,
+		[]string{activeKey, leaseKey, pendingKey, taskKey},
+		taskID,
+	).Int()
+	if err != nil {
+		return 0, fmt.Errorf("requeue-active script failed for task %s: %w", taskID, err)
+	}
+	return removed, nil
 }

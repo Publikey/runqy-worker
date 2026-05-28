@@ -27,6 +27,15 @@ type processor struct {
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	logger    Logger
+
+	// In-flight tasks owned by this processor (taskID -> sub-queue name).
+	// Used to renew leases while processing and to requeue leftovers on shutdown.
+	inflight   map[string]string
+	inflightMu sync.Mutex
+
+	// Lease extender lifecycle.
+	leaseDone chan struct{}
+	leaseWg   sync.WaitGroup
 }
 
 // newProcessor creates a new processor.
@@ -43,7 +52,34 @@ func newProcessor(rdb *redisClient, handler Handler, cfg Config) *processor {
 		done:          make(chan struct{}),
 		stopping:      make(chan struct{}),
 		logger:        cfg.Logger,
+		inflight:      make(map[string]string),
+		leaseDone:     make(chan struct{}),
 	}
+}
+
+// trackInflight records a task as in-flight (owned by this processor).
+func (p *processor) trackInflight(taskID, queueName string) {
+	p.inflightMu.Lock()
+	p.inflight[taskID] = queueName
+	p.inflightMu.Unlock()
+}
+
+// untrackInflight removes a task from the in-flight set.
+func (p *processor) untrackInflight(taskID string) {
+	p.inflightMu.Lock()
+	delete(p.inflight, taskID)
+	p.inflightMu.Unlock()
+}
+
+// snapshotInflight returns a copy of the current in-flight tasks (taskID -> queue).
+func (p *processor) snapshotInflight() map[string]string {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	out := make(map[string]string, len(p.inflight))
+	for k, v := range p.inflight {
+		out[k] = v
+	}
+	return out
 }
 
 // SetQueueHandler sets the handler for a specific queue.
@@ -95,6 +131,52 @@ func (p *processor) start() {
 		p.wg.Add(1)
 		go p.worker(i)
 	}
+	// Renew leases of in-flight tasks so a live worker keeps ownership while a
+	// dead worker's leases expire and become recoverable.
+	p.leaseWg.Add(1)
+	go p.leaseExtenderLoop()
+}
+
+// leaseExtenderLoop periodically renews the leases of all in-flight tasks.
+func (p *processor) leaseExtenderLoop() {
+	defer p.leaseWg.Done()
+
+	interval := p.config.LeaseExtendInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.leaseDone:
+			return
+		case <-ticker.C:
+			p.extendInflightLeases()
+		}
+	}
+}
+
+// extendInflightLeases renews the lease for every currently in-flight task.
+func (p *processor) extendInflightLeases() {
+	snapshot := p.snapshotInflight()
+	if len(snapshot) == 0 {
+		return
+	}
+
+	p.redisMu.RLock()
+	rdb := p.redis
+	p.redisMu.RUnlock()
+
+	leaseDuration := p.config.LeaseDuration
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for taskID, queueName := range snapshot {
+		if err := rdb.extendLease(ctx, taskID, queueName, leaseDuration); err != nil {
+			p.logger.Warn("Failed to extend lease for task %s (queue=%s): %v", taskID, queueName, err)
+		}
+	}
 }
 
 // stop gracefully stops all workers.
@@ -125,6 +207,12 @@ func (p *processor) stop() {
 		p.cancel()
 		p.wg.Wait()
 	}
+
+	// Phase 4: Stop the lease extender now that no task goroutines remain.
+	// Any task left in-flight here was force-cancelled; the caller requeues it
+	// via snapshotInflight(), and its lease will no longer be renewed.
+	close(p.leaseDone)
+	p.leaseWg.Wait()
 }
 
 // worker is a single worker goroutine.
@@ -157,7 +245,7 @@ func (p *processor) processOne(ctx context.Context) {
 	p.redisMu.RUnlock()
 
 	// Dequeue a task
-	task, err := redisClient.dequeue(ctx, p.queues)
+	task, err := redisClient.dequeue(ctx, p.queues, p.config.LeaseDuration)
 	if err != nil {
 		p.logger.Error("Dequeue error: %v", err)
 
@@ -189,6 +277,11 @@ func (p *processor) processOne(ctx context.Context) {
 	}
 
 	queueName := task.queue
+
+	// Track as in-flight: the lease extender renews its lease while it runs, and
+	// graceful shutdown can requeue it if it doesn't finish. Untracked by the
+	// terminal handlers (handleSuccess/handleError) below.
+	p.trackInflight(task.id, queueName)
 
 	// Extract parent queue for supervisor health check (sub-queue -> parent)
 	parentQueue := parentQueueName(queueName)
@@ -226,6 +319,13 @@ func (p *processor) processOne(ctx context.Context) {
 	}
 
 	if err != nil {
+		// If the processor is shutting down (context cancelled), the error is just
+		// cancellation, not a real task failure. Leave the task in-flight (still in
+		// active/lease) so the graceful-shutdown requeue moves it back to pending
+		// without counting a retry.
+		if ctx.Err() != nil {
+			return
+		}
 		p.handleError(ctx, task, queueName, err)
 	} else {
 		p.handleSuccess(ctx, task, queueName)
@@ -251,6 +351,13 @@ func (p *processor) redisRetry(operation string, taskID string, fn func() error)
 
 // handleSuccess handles successful task completion.
 func (p *processor) handleSuccess(ctx context.Context, task *Task, queueName string) {
+	defer p.untrackInflight(task.id)
+
+	// Use a detached context so completion bookkeeping persists even if the
+	// processor context was cancelled during shutdown.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	// Check if redis storage is enabled for this queue
 	storeInRedis := true
 	if state, ok := p.subQueueToState[queueName]; ok {
@@ -275,7 +382,14 @@ func (p *processor) handleSuccess(ctx context.Context, task *Task, queueName str
 
 // handleError handles task processing errors.
 func (p *processor) handleError(ctx context.Context, task *Task, queueName string, err error) {
+	defer p.untrackInflight(task.id)
+
 	p.logger.Error(fmt.Sprintf("Task %s failed: %v", task.id, err))
+
+	// Use a detached context so retry/fail bookkeeping persists even if the
+	// processor context was cancelled during shutdown.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	// Check if redis storage is enabled for this queue
 	storeInRedis := true

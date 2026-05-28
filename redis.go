@@ -34,9 +34,10 @@ func newRedisClient(rdb *goredis.Client, logger Logger) *redisClient {
 }
 
 // dequeue attempts to dequeue a task from the given queues.
+// leaseDuration sets the initial lease validity for the dequeued task.
 // Returns nil if no task is available.
-func (r *redisClient) dequeue(ctx context.Context, queues []string) (*Task, error) {
-	taskData, err := r.internal.Dequeue(ctx, queues)
+func (r *redisClient) dequeue(ctx context.Context, queues []string, leaseDuration time.Duration) (*Task, error) {
+	taskData, err := r.internal.Dequeue(ctx, queues, leaseDuration)
 	if err != nil {
 		return nil, err
 	}
@@ -112,4 +113,34 @@ func (r *redisClient) incrementProcessed(ctx context.Context, queueName string) 
 // incrementFailed increments the failed counters for a queue.
 func (r *redisClient) incrementFailed(ctx context.Context, queueName string) error {
 	return r.internal.IncrementFailed(ctx, queueName)
+}
+
+// listLeaseExpired returns tasks with expired leases for a given queue.
+func (r *redisClient) listLeaseExpired(ctx context.Context, queueName string, cutoff time.Time) ([]*redis.TaskData, error) {
+	return r.internal.ListLeaseExpired(ctx, queueName, cutoff)
+}
+
+// recoverToRetry moves an expired-lease task to retry with delay.
+func (r *redisClient) recoverToRetry(ctx context.Context, task *redis.TaskData, queueName string, delay time.Duration) error {
+	return r.internal.RecoverToRetry(ctx, task, queueName, delay)
+}
+
+// recoverToArchive moves an expired-lease task to archived.
+func (r *redisClient) recoverToArchive(ctx context.Context, task *redis.TaskData, queueName string) error {
+	return r.internal.RecoverToArchive(ctx, task, queueName)
+}
+
+// recoverOrphaned removes an orphaned task from active and lease.
+func (r *redisClient) recoverOrphaned(ctx context.Context, taskID string, queueName string) error {
+	return r.internal.RecoverOrphaned(ctx, taskID, queueName)
+}
+
+// extendLease renews the lease of an in-flight task.
+func (r *redisClient) extendLease(ctx context.Context, taskID, queueName string, leaseDuration time.Duration) error {
+	return r.internal.ExtendLease(ctx, taskID, queueName, leaseDuration)
+}
+
+// requeueActive moves a single in-flight task from active back to pending (if still active).
+func (r *redisClient) requeueActive(ctx context.Context, taskID, queueName string) (int, error) {
+	return r.internal.RequeueActive(ctx, taskID, queueName)
 }
