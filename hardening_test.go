@@ -145,6 +145,33 @@ func newTestProcessor(cfg Config) *processor {
 		done:          make(chan struct{}),
 		stopping:      make(chan struct{}),
 		logger:        cfg.Logger,
+		inflight:      make(map[string]string),
+		leaseDone:     make(chan struct{}),
+	}
+}
+
+// TestProcessorInflightRegistry verifies the in-flight task registry that backs
+// lease extension and shutdown requeue: tracking/untracking, and that
+// snapshotInflight returns an independent copy (so the shutdown requeue can
+// iterate it safely while task goroutines untrack concurrently).
+func TestProcessorInflightRegistry(t *testing.T) {
+	p := newTestProcessor(DefaultConfig())
+
+	p.trackInflight("t1", "q.default")
+	p.trackInflight("t2", "q.high")
+
+	snap := p.snapshotInflight()
+	if len(snap) != 2 || snap["t1"] != "q.default" || snap["t2"] != "q.high" {
+		t.Fatalf("unexpected snapshot: %v", snap)
+	}
+
+	// The snapshot must be a copy: untracking after taking it must not mutate it.
+	p.untrackInflight("t1")
+	if _, ok := snap["t1"]; !ok {
+		t.Fatal("snapshot should be an independent copy, but t1 disappeared after untrack")
+	}
+	if s2 := p.snapshotInflight(); len(s2) != 1 || s2["t2"] != "q.high" {
+		t.Fatalf("after untracking t1, expected only t2, got: %v", s2)
 	}
 }
 

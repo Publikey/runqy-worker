@@ -33,14 +33,15 @@ type QueueState struct {
 
 // Worker processes tasks from Redis queues.
 type Worker struct {
-	config        Config
-	rdb           *redis.Client
-	mux           *ServeMux
-	processor     *processor
-	heartbeat     *heartbeat
-	forwarder     *retryForwarder
-	reconnector   *redisReconnector
-	queueHandlers map[string]HandlerFunc // stored until processor is created
+	config         Config
+	rdb            *redis.Client
+	mux            *ServeMux
+	processor      *processor
+	heartbeat      *heartbeat
+	forwarder      *retryForwarder
+	leaseRecoverer *leaseRecoverer
+	reconnector    *redisReconnector
+	queueHandlers  map[string]HandlerFunc // stored until processor is created
 
 	// Multi-queue bootstrap state
 	queueStates  map[string]*QueueState
@@ -640,6 +641,9 @@ func (w *Worker) Run() error {
 	// Create retry forwarder — scans retry sorted sets and moves ready tasks to pending
 	w.forwarder = newRetryForwarder(redisClient, &w.processor.redisMu, w.processor.queues, 5*time.Second, w.logger)
 
+	// Create lease recoverer — scans lease sorted sets for expired tasks and recovers them
+	w.leaseRecoverer = newLeaseRecoverer(redisClient, &w.processor.redisMu, w.processor.queues, 60*time.Second, w.logger)
+
 	// Set queue states for per-queue health checks
 	w.processor.SetQueueStates(w.queueStates)
 
@@ -656,8 +660,9 @@ func (w *Worker) Run() error {
 			w.rdb = client
 			w.heartbeat.updateClient(client)
 			w.processor.updateClient(client, w.logger)
-			// Update forwarder's redis client under the shared lock
+			// Update forwarder's and recoverer's redis client under the shared lock
 			w.forwarder.updateClient(newRedisClient(client, w.logger))
+			w.leaseRecoverer.updateClient(newRedisClient(client, w.logger))
 		})
 		w.processor.SetReconnector(w.reconnector)
 	} else {
@@ -670,6 +675,7 @@ func (w *Worker) Run() error {
 	}
 	w.processor.start()
 	w.forwarder.start()
+	w.leaseRecoverer.start()
 
 	w.logger.Info("Worker running. Press Ctrl+C to stop.")
 
@@ -724,6 +730,9 @@ func (w *Worker) Start(ctx context.Context) error {
 	// Create retry forwarder — scans retry sorted sets and moves ready tasks to pending
 	w.forwarder = newRetryForwarder(redisClient, &w.processor.redisMu, w.processor.queues, 5*time.Second, w.logger)
 
+	// Create lease recoverer — scans lease sorted sets for expired tasks and recovers them
+	w.leaseRecoverer = newLeaseRecoverer(redisClient, &w.processor.redisMu, w.processor.queues, 60*time.Second, w.logger)
+
 	// Set queue states for per-queue health checks
 	w.processor.SetQueueStates(w.queueStates)
 
@@ -741,6 +750,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			w.heartbeat.updateClient(client)
 			w.processor.updateClient(client, w.logger)
 			w.forwarder.updateClient(newRedisClient(client, w.logger))
+			w.leaseRecoverer.updateClient(newRedisClient(client, w.logger))
 		})
 		w.processor.SetReconnector(w.reconnector)
 	} else {
@@ -753,6 +763,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 	w.processor.start()
 	w.forwarder.start()
+	w.leaseRecoverer.start()
 
 	w.logger.Info("Worker running.")
 
@@ -779,6 +790,11 @@ func (w *Worker) Shutdown() {
 
 // shutdown performs the actual shutdown sequence.
 func (w *Worker) shutdown() error {
+	w.logger.Info("Stopping lease recoverer...")
+	if w.leaseRecoverer != nil {
+		w.leaseRecoverer.stop()
+	}
+
 	w.logger.Info("Stopping retry forwarder...")
 	if w.forwarder != nil {
 		w.forwarder.stop()
@@ -787,6 +803,21 @@ func (w *Worker) shutdown() error {
 	w.logger.Info("Stopping processor...")
 	if w.processor != nil {
 		w.processor.stop()
+	}
+
+	// Requeue THIS worker's own remaining in-flight tasks (those force-cancelled
+	// at shutdown) back to pending before closing Redis. Operating on the specific
+	// task IDs avoids disturbing tasks still being processed by other workers that
+	// share the same sub-queue's active/lease keys.
+	if w.processor != nil && w.rdb != nil {
+		inflight := w.processor.snapshotInflight()
+		if len(inflight) > 0 {
+			w.logger.Info("Recovering remaining active tasks to pending...")
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			redisClient := newRedisClient(w.rdb, w.logger)
+			recoverActiveOnShutdown(ctx, redisClient, inflight, w.logger)
+			cancel()
+		}
 	}
 
 	w.logger.Info("Stopping heartbeat...")

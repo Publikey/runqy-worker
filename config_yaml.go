@@ -178,6 +178,18 @@ func loadConfigFromEnv() Config {
 		}
 	}
 
+	// Lease settings
+	if lease := os.Getenv("RUNQY_LEASE_DURATION"); lease != "" {
+		if d, err := time.ParseDuration(lease); err == nil && d > 0 {
+			cfg.LeaseDuration = d
+		}
+	}
+	if interval := os.Getenv("RUNQY_LEASE_EXTEND_INTERVAL"); interval != "" {
+		if d, err := time.ParseDuration(interval); err == nil && d > 0 {
+			cfg.LeaseExtendInterval = d
+		}
+	}
+
 	// Bootstrap settings
 	if retries := os.Getenv("RUNQY_BOOTSTRAP_RETRIES"); retries != "" {
 		if n, err := strconv.Atoi(retries); err == nil && n > 0 {
