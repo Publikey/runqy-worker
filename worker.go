@@ -40,6 +40,7 @@ type Worker struct {
 	heartbeat      *heartbeat
 	forwarder      *retryForwarder
 	leaseRecoverer *leaseRecoverer
+	janitor        *janitor
 	reconnector    *redisReconnector
 	queueHandlers  map[string]HandlerFunc // stored until processor is created
 
@@ -644,6 +645,11 @@ func (w *Worker) Run() error {
 	// Create lease recoverer — scans lease sorted sets for expired tasks and recovers them
 	w.leaseRecoverer = newLeaseRecoverer(redisClient, &w.processor.redisMu, w.processor.queues, 60*time.Second, w.logger)
 
+	// Create janitor — trims the :completed/:archived sorted sets (asynq's janitor never
+	// runs because the server only acts as a Client/Inspector). Uses the completed-task TTL
+	// as the retention window.
+	w.janitor = newJanitor(redisClient, &w.processor.redisMu, w.processor.queues, 1*time.Minute, w.logger)
+
 	// Set queue states for per-queue health checks
 	w.processor.SetQueueStates(w.queueStates)
 
@@ -663,6 +669,7 @@ func (w *Worker) Run() error {
 			// Update forwarder's and recoverer's redis client under the shared lock
 			w.forwarder.updateClient(newRedisClient(client, w.logger))
 			w.leaseRecoverer.updateClient(newRedisClient(client, w.logger))
+			w.janitor.updateClient(newRedisClient(client, w.logger))
 		})
 		w.processor.SetReconnector(w.reconnector)
 	} else {
@@ -676,6 +683,7 @@ func (w *Worker) Run() error {
 	w.processor.start()
 	w.forwarder.start()
 	w.leaseRecoverer.start()
+	w.janitor.start()
 
 	w.logger.Info("Worker running. Press Ctrl+C to stop.")
 
@@ -733,6 +741,11 @@ func (w *Worker) Start(ctx context.Context) error {
 	// Create lease recoverer — scans lease sorted sets for expired tasks and recovers them
 	w.leaseRecoverer = newLeaseRecoverer(redisClient, &w.processor.redisMu, w.processor.queues, 60*time.Second, w.logger)
 
+	// Create janitor — trims the :completed/:archived sorted sets (asynq's janitor never
+	// runs because the server only acts as a Client/Inspector). Uses the completed-task TTL
+	// as the retention window.
+	w.janitor = newJanitor(redisClient, &w.processor.redisMu, w.processor.queues, 1*time.Minute, w.logger)
+
 	// Set queue states for per-queue health checks
 	w.processor.SetQueueStates(w.queueStates)
 
@@ -751,6 +764,7 @@ func (w *Worker) Start(ctx context.Context) error {
 			w.processor.updateClient(client, w.logger)
 			w.forwarder.updateClient(newRedisClient(client, w.logger))
 			w.leaseRecoverer.updateClient(newRedisClient(client, w.logger))
+			w.janitor.updateClient(newRedisClient(client, w.logger))
 		})
 		w.processor.SetReconnector(w.reconnector)
 	} else {
@@ -764,6 +778,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	w.processor.start()
 	w.forwarder.start()
 	w.leaseRecoverer.start()
+	w.janitor.start()
 
 	w.logger.Info("Worker running.")
 
@@ -790,6 +805,11 @@ func (w *Worker) Shutdown() {
 
 // shutdown performs the actual shutdown sequence.
 func (w *Worker) shutdown() error {
+	w.logger.Info("Stopping janitor...")
+	if w.janitor != nil {
+		w.janitor.stop()
+	}
+
 	w.logger.Info("Stopping lease recoverer...")
 	if w.leaseRecoverer != nil {
 		w.leaseRecoverer.stop()

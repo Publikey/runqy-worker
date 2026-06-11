@@ -307,15 +307,42 @@ func (p *processor) processOne(ctx context.Context) {
 		}
 	}
 
+	// Pending timeout: if the task waited too long in :pending before being picked up,
+	// archive it directly (no retry, no execution). Lazy enforcement at dequeue time.
+	if pt := p.pendingTimeout(task); pt > 0 && task.pendingSince > 0 {
+		if age := time.Since(time.Unix(task.pendingSince, 0)); age > pt {
+			p.logger.Warn(fmt.Sprintf("Task %s exceeded pending timeout (%v old > %v) — archiving without execution", task.id, age.Truncate(time.Second), pt))
+			p.handlePendingTimeout(task, queueName, age)
+			return
+		}
+	}
+
 	p.logger.Info(fmt.Sprintf("Processing task %s (queue=%s, type=%s, retry=%d)", task.id, queueName, task.typename, task.retry))
+
+	// Active timeout: bound task execution. On timeout, taskCtx is cancelled, the handler
+	// returns its ctx error, and it flows to handleError as a retriable failure. The stdio
+	// handler dispatches responses by task ID, so a late response from the abandoned task is
+	// simply dropped ("unknown task") — the protocol is not desynced.
+	taskCtx := ctx
+	if at := p.activeTimeout(task); at > 0 {
+		var cancelTask context.CancelFunc
+		taskCtx, cancelTask = context.WithTimeout(ctx, at)
+		defer cancelTask()
+	}
 
 	// Process the task - try queue handler first, then fall back to type-based handler
 	if handler, ok := p.queueHandlers[queueName]; ok {
-		err = handler(ctx, task)
+		err = handler(taskCtx, task)
 	} else if p.handler != nil {
-		err = p.handler.ProcessTask(ctx, task)
+		err = p.handler.ProcessTask(taskCtx, task)
 	} else {
 		err = fmt.Errorf("no handler configured for queue %q", queueName)
+	}
+
+	// Distinguish an active-timeout (task-scoped deadline) from a processor shutdown
+	// (processor ctx cancelled): only the latter must leave the task in-flight for requeue.
+	if err != nil && taskCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+		err = fmt.Errorf("active timeout exceeded (%v): %w", p.activeTimeout(task), err)
 	}
 
 	if err != nil {
@@ -349,6 +376,64 @@ func (p *processor) redisRetry(operation string, taskID string, fn func() error)
 	return lastErr
 }
 
+// Per-task lifecycle resolvers: use the server-stamped value when present (>= 0),
+// otherwise fall back to the worker's config default.
+func (p *processor) ttlCompleted(t *Task) time.Duration {
+	if t.ttlCompleted >= 0 {
+		return t.ttlCompleted
+	}
+	return p.config.TTLCompleted
+}
+
+func (p *processor) ttlArchived(t *Task) time.Duration {
+	if t.ttlArchived >= 0 {
+		return t.ttlArchived
+	}
+	return p.config.TTLArchived
+}
+
+func (p *processor) activeTimeout(t *Task) time.Duration {
+	if t.activeTimeout >= 0 {
+		return t.activeTimeout
+	}
+	return p.config.ActiveTimeout
+}
+
+func (p *processor) pendingTimeout(t *Task) time.Duration {
+	if t.pendingTimeout >= 0 {
+		return t.pendingTimeout
+	}
+	return p.config.PendingTimeout
+}
+
+// handlePendingTimeout archives a task that waited too long in :pending, directly and without
+// retry (the task is already in :active/:lease from dequeue; fail() removes it and archives).
+func (p *processor) handlePendingTimeout(task *Task, queueName string, age time.Duration) {
+	defer p.untrackInflight(task.id)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	storeInRedis := true
+	if state, ok := p.subQueueToState[queueName]; ok {
+		storeInRedis = state.RedisStorage
+	}
+
+	reason := fmt.Sprintf("pending timeout: waited %v before pickup", age.Truncate(time.Second))
+	if storeInRedis {
+		p.redisRetry("fail", task.id, func() error {
+			return p.redis.fail(ctx, task, queueName, reason, p.ttlArchived(task))
+		})
+	} else {
+		p.redisRetry("cleanupActive", task.id, func() error {
+			return p.redis.cleanupActive(ctx, task, queueName)
+		})
+	}
+	if err := p.redis.incrementFailed(ctx, queueName); err != nil {
+		p.logger.Error("Failed to increment failed counter: %v", err)
+	}
+}
+
 // handleSuccess handles successful task completion.
 func (p *processor) handleSuccess(ctx context.Context, task *Task, queueName string) {
 	defer p.untrackInflight(task.id)
@@ -366,7 +451,7 @@ func (p *processor) handleSuccess(ctx context.Context, task *Task, queueName str
 
 	if storeInRedis {
 		p.redisRetry("complete", task.id, func() error {
-			return p.redis.complete(ctx, task, queueName, p.config.CompletedTaskTTL)
+			return p.redis.complete(ctx, task, queueName, p.ttlCompleted(task))
 		})
 	} else {
 		// Just clean up the active queue without storing completion
@@ -402,7 +487,7 @@ func (p *processor) handleError(ctx context.Context, task *Task, queueName strin
 		p.logger.Warn(fmt.Sprintf("Task %s marked as permanent failure, skipping retry", task.id))
 		if storeInRedis {
 			p.redisRetry("fail", task.id, func() error {
-				return p.redis.fail(ctx, task, queueName, err.Error(), p.config.CompletedTaskTTL)
+				return p.redis.fail(ctx, task, queueName, err.Error(), p.ttlArchived(task))
 			})
 		} else {
 			p.redisRetry("cleanupActive", task.id, func() error {
@@ -435,7 +520,7 @@ func (p *processor) handleError(ctx context.Context, task *Task, queueName strin
 
 		if storeInRedis {
 			p.redisRetry("fail", task.id, func() error {
-				return p.redis.fail(ctx, task, queueName, err.Error(), p.config.CompletedTaskTTL)
+				return p.redis.fail(ctx, task, queueName, err.Error(), p.ttlArchived(task))
 			})
 		} else {
 			p.redisRetry("cleanupActive", task.id, func() error {

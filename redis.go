@@ -48,14 +48,19 @@ func (r *redisClient) dequeue(ctx context.Context, queues []string, leaseDuratio
 
 	// Convert TaskData to Task
 	task := &Task{
-		id:       taskData.ID,
-		typename: taskData.Type,
-		payload:  taskData.Payload,
-		retry:    taskData.Retry,
-		maxRetry: taskData.MaxRetry,
-		queue:    taskData.Queue,
-		rdb:      r.rdb,
-		taskKey:  taskData.TaskKey,
+		id:             taskData.ID,
+		typename:       taskData.Type,
+		payload:        taskData.Payload,
+		retry:          taskData.Retry,
+		maxRetry:       taskData.MaxRetry,
+		queue:          taskData.Queue,
+		pendingSince:   taskData.PendingSince,
+		ttlCompleted:   taskData.TTLCompleted,
+		ttlArchived:    taskData.TTLArchived,
+		pendingTimeout: taskData.PendingTimeout,
+		activeTimeout:  taskData.ActiveTimeout,
+		rdb:            r.rdb,
+		taskKey:        taskData.TaskKey,
 	}
 
 	return task, nil
@@ -93,6 +98,12 @@ func (r *redisClient) fail(ctx context.Context, task *Task, queueName string, er
 // forwardReady moves tasks from retry sorted sets to pending for the given queues.
 func (r *redisClient) forwardReady(ctx context.Context, queues []string) (int, error) {
 	return r.internal.ForwardReady(ctx, queues)
+}
+
+// cleanFinished trims the :completed and :archived sorted sets, removing entries whose per-task
+// expiry has passed, along with their task hashes and reverse-lookup keys.
+func (r *redisClient) cleanFinished(ctx context.Context, queues []string) (int, error) {
+	return r.internal.CleanFinished(ctx, queues)
 }
 
 // ping checks Redis connectivity.

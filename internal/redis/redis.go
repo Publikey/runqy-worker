@@ -5,11 +5,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
+
+// parseSecondsField reads an integer-seconds hash field into a Duration.
+// Returns -1 when the field is absent so callers can apply their own fallback;
+// a present "0" yields 0 (explicitly disabled / no expiry).
+func parseSecondsField(data map[string]string, field string) time.Duration {
+	if v, ok := data[field]; ok {
+		if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return -1
+}
 
 // Logger interface for redis package logging.
 type Logger interface {
@@ -31,6 +44,7 @@ const (
 	KeyCompleted  = KeyPrefix + "{%s}:completed" // Sorted set of completed task IDs
 	KeyArchived   = KeyPrefix + "{%s}:archived"  // Sorted set of failed/archived task IDs
 	KeyTask       = KeyPrefix + "{%s}:t:%s"      // Task data hash: asynq:{queue}:t:{taskID}
+	KeyTaskLookup = KeyPrefix + "t:%s"           // Reverse-lookup hash (task_id -> queue), written by the server; NOT queue-scoped/hash-tagged
 	KeyWorkers    = KeyPrefix + "workers"        // Set of worker IDs
 	KeyWorkerData = KeyPrefix + "workers:%s"     // Worker data hash
 
@@ -59,6 +73,12 @@ const (
 	FieldQueue    = "queue"
 	FieldTimeout  = "timeout"
 	FieldDeadline = "deadline"
+	// Per-task lifecycle fields stamped by the server at enqueue (values in seconds).
+	// Absent → the worker applies its config fallback; "0" → explicitly disabled / no expiry.
+	FieldTTLCompleted   = "ttl_completed"   // TTL for successful completion
+	FieldTTLArchived    = "ttl_archived"    // TTL for failure/archival
+	FieldPendingTimeout = "pending_timeout" // Max age in pending before archive
+	FieldActiveTimeout  = "active_timeout"  // Max execution time before retriable timeout
 )
 
 // Task states (asynq-compatible)
@@ -80,6 +100,14 @@ type TaskData struct {
 	MaxRetry int    // Maximum retry attempts
 	Queue    string
 	TaskKey  string // The task hash key: asynq:{queue}:t:{taskID}
+
+	// Per-task lifecycle values stamped by the server. A negative Duration means the field
+	// was absent (caller applies its config fallback); 0 means explicitly disabled/no expiry.
+	PendingSince   int64         // unix seconds when the task entered pending (0 = unknown)
+	TTLCompleted   time.Duration // -1 = absent
+	TTLArchived    time.Duration // -1 = absent
+	PendingTimeout time.Duration // -1 = absent
+	ActiveTimeout  time.Duration // -1 = absent
 }
 
 // TypedResponse is the canonical structure used to store task results.
@@ -360,32 +388,59 @@ func (r *Client) Dequeue(ctx context.Context, queues []string, leaseDuration tim
 		return nil, fmt.Errorf("activate script failed for task %s: %w", taskID, err)
 	}
 
+	// Capture pending_since BEFORE the activate script HDELs it, plus the per-task
+	// lifecycle values stamped by the server (absent fields → -1, caller falls back to config).
+	var pendingSince int64
+	if v, ok := data[FieldPendingSince]; ok {
+		pendingSince, _ = strconv.ParseInt(v, 10, 64)
+	}
+
 	taskData := &TaskData{
-		ID:       taskID,
-		Type:     taskType,
-		Payload:  payload,
-		Retry:    retried,
-		MaxRetry: maxRetry,
-		Queue:    queueName,
-		TaskKey:  taskKey,
+		ID:             taskID,
+		Type:           taskType,
+		Payload:        payload,
+		Retry:          retried,
+		MaxRetry:       maxRetry,
+		Queue:          queueName,
+		TaskKey:        taskKey,
+		PendingSince:   pendingSince,
+		TTLCompleted:   parseSecondsField(data, FieldTTLCompleted),
+		TTLArchived:    parseSecondsField(data, FieldTTLArchived),
+		PendingTimeout: parseSecondsField(data, FieldPendingTimeout),
+		ActiveTimeout:  parseSecondsField(data, FieldActiveTimeout),
 	}
 
 	return taskData, nil
 }
 
+// neverExpireSeconds is the :completed/:archived ZSet score offset used when a task has no
+// TTL (ttl <= 0). The score encodes the task's expiry time so the janitor can purge uniformly
+// ("score < now"); a ~100-year offset keeps no-expiry entries effectively permanent.
+const neverExpireSeconds = int64(100 * 365 * 24 * 3600)
+
 // completeCmd atomically removes a task from active/lease and marks it as completed.
 // KEYS[1] = activeKey, KEYS[2] = leaseKey, KEYS[3] = completedKey, KEYS[4] = taskKey
-// ARGV[1] = taskID, ARGV[2] = now (unix), ARGV[3] = state, ARGV[4] = ttl (seconds, 0 = no expiry)
+// ARGV[1] = taskID, ARGV[2] = now (unix), ARGV[3] = state, ARGV[4] = ttl (seconds, 0 = no expiry),
+// ARGV[5] = expiry score (unix seconds the entry becomes purgeable by the janitor)
 var completeCmd = redis.NewScript(`
 redis.call("LREM", KEYS[1], 0, ARGV[1])
 redis.call("ZREM", KEYS[2], ARGV[1])
-redis.call("ZADD", KEYS[3], ARGV[2], ARGV[1])
+redis.call("ZADD", KEYS[3], ARGV[5], ARGV[1])
 redis.call("HSET", KEYS[4], "state", ARGV[3], "completed_at", ARGV[2])
 if tonumber(ARGV[4]) > 0 then
     redis.call("EXPIRE", KEYS[4], ARGV[4])
 end
 return 1
 `)
+
+// expiryScore returns the ZSet score (unix seconds) at which a finished task becomes purgeable:
+// now+ttl when ttl>0, else a far-future sentinel so no-expiry entries are never purged.
+func expiryScore(now int64, ttl time.Duration) int64 {
+	if ttl > 0 {
+		return now + int64(ttl.Seconds())
+	}
+	return now + neverExpireSeconds
+}
 
 // Complete marks a task as completed and removes it from active queue.
 // Results are already written to the task hash by TaskResultWriter.
@@ -414,9 +469,16 @@ func (r *Client) Complete(ctx context.Context, taskID string, queueName string, 
 	}
 	if err := completeCmd.Run(ctx, r.Rdb,
 		[]string{activeKey, leaseKey, completedKey, taskKey},
-		taskID, now, StateCompleted, ttlSecs,
+		taskID, now, StateCompleted, ttlSecs, expiryScore(now, ttl),
 	).Err(); err != nil {
 		return fmt.Errorf("complete script failed for task %s: %w", taskID, err)
+	}
+
+	// Realign the server-written reverse-lookup key (asynq:t:<id>) with the task's TTL so
+	// it doesn't outlive the task hash. Best-effort, separate call: it lives outside the
+	// queue hash-tag and so can't be part of the multi-key Lua script above.
+	if ttl > 0 {
+		r.Rdb.Expire(ctx, fmt.Sprintf(KeyTaskLookup, taskID), ttl)
 	}
 
 	return nil
@@ -556,11 +618,12 @@ func (r *Client) ForwardReady(ctx context.Context, queues []string) (int, error)
 
 // failCmd atomically removes from active/lease and archives a task.
 // KEYS[1] = activeKey, KEYS[2] = leaseKey, KEYS[3] = archivedKey, KEYS[4] = taskKey
-// ARGV[1] = taskID, ARGV[2] = now (unix), ARGV[3] = errMsg, ARGV[4] = ttl (seconds, 0 = no expiry)
+// ARGV[1] = taskID, ARGV[2] = now (unix), ARGV[3] = errMsg, ARGV[4] = ttl (seconds, 0 = no expiry),
+// ARGV[5] = expiry score (unix seconds the entry becomes purgeable by the janitor)
 var failCmd = redis.NewScript(`
 redis.call("LREM", KEYS[1], 0, ARGV[1])
 redis.call("ZREM", KEYS[2], ARGV[1])
-redis.call("ZADD", KEYS[3], ARGV[2], ARGV[1])
+redis.call("ZADD", KEYS[3], ARGV[5], ARGV[1])
 redis.call("HSET", KEYS[4], "state", "archived", "error_msg", ARGV[3], "last_failed_at", ARGV[2])
 if tonumber(ARGV[4]) > 0 then
     redis.call("EXPIRE", KEYS[4], ARGV[4])
@@ -597,12 +660,72 @@ func (r *Client) Fail(ctx context.Context, task *TaskData, queueName string, err
 	}
 	if err := failCmd.Run(ctx, r.Rdb,
 		[]string{activeKey, leaseKey, archivedKey, taskKey},
-		task.ID, now, errMsg, ttlSecs,
+		task.ID, now, errMsg, ttlSecs, expiryScore(now, ttl),
 	).Err(); err != nil {
 		return fmt.Errorf("fail script failed for task %s: %w", task.ID, err)
 	}
 
+	// Realign the server-written reverse-lookup key (asynq:t:<id>) with the task's TTL
+	// (see Complete). Best-effort, outside the queue hash-tag.
+	if ttl > 0 {
+		r.Rdb.Expire(ctx, fmt.Sprintf(KeyTaskLookup, task.ID), ttl)
+	}
+
 	return nil
+}
+
+// cleanFinishedBatchSize bounds how many expired entries are removed per Lua call.
+const cleanFinishedBatchSize = 100
+
+// cleanFinishedCmd removes expired members from a finished-task sorted set (completed or
+// archived) and deletes their queue-scoped task hashes. All keys share the {queue} hash
+// tag, so this is Redis-Cluster safe (mirrors upstream asynq's janitor).
+// KEYS[1] = finishedKey (the :completed or :archived ZSet)
+// ARGV[1] = cutoff score (unix seconds), ARGV[2] = task hash prefix "asynq:{queue}:t:",
+// ARGV[3] = batch limit. Returns the list of removed task IDs.
+var cleanFinishedCmd = redis.NewScript(`
+local ids = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, tonumber(ARGV[3]))
+for _, id in ipairs(ids) do
+    redis.call("DEL", ARGV[2] .. id)
+    redis.call("ZREM", KEYS[1], id)
+end
+return ids
+`)
+
+// CleanFinished trims the :completed and :archived sorted sets, removing entries whose expiry
+// score (set by Complete/Fail to now+ttl) has passed. It also deletes the queue-scoped task hash
+// and the server-written reverse-lookup key (asynq:t:<id>) for each removed entry. This is the
+// worker-side replacement for asynq's janitor, which never runs (the server uses asynq only as a
+// Client/Inspector). Per-task TTLs are honoured because the score encodes each task's own expiry.
+// Returns the total number of entries removed.
+func (r *Client) CleanFinished(ctx context.Context, queues []string) (int, error) {
+	cutoff := time.Now().Unix()
+	total := 0
+	for _, q := range queues {
+		taskPrefix := fmt.Sprintf(KeyTask, q, "") // "asynq:{queue}:t:"
+		for _, zkey := range []string{fmt.Sprintf(KeyCompleted, q), fmt.Sprintf(KeyArchived, q)} {
+			// Drain in batches so a large backlog clears over successive calls without one
+			// giant blocking script. Cap iterations to keep a single cycle bounded.
+			for i := 0; i < 100; i++ {
+				ids, err := cleanFinishedCmd.Run(ctx, r.Rdb,
+					[]string{zkey}, cutoff, taskPrefix, cleanFinishedBatchSize,
+				).StringSlice()
+				if err != nil {
+					return total, fmt.Errorf("clean finished failed for %s: %w", zkey, err)
+				}
+				for _, id := range ids {
+					// Reverse-lookup key is not queue-scoped, so it must be deleted outside
+					// the script; per-id DEL is Cluster-safe (each routed to its own slot).
+					r.Rdb.Del(ctx, fmt.Sprintf(KeyTaskLookup, id))
+				}
+				total += len(ids)
+				if len(ids) < cleanFinishedBatchSize {
+					break
+				}
+			}
+		}
+	}
+	return total, nil
 }
 
 // Ping checks Redis connectivity.
