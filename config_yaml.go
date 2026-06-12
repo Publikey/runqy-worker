@@ -93,11 +93,17 @@ type AuthConfig struct {
 
 // WorkerConfig holds worker settings from YAML.
 type WorkerConfig struct {
-	Queue            string   `yaml:"queue"`              // DEPRECATED: Single queue name (backward compat)
-	Queues           []string `yaml:"queues"`             // List of queue names to listen on
-	Concurrency      int      `yaml:"concurrency"`
-	ShutdownTimeout  string   `yaml:"shutdown_timeout"`
-	CompletedTaskTTL string   `yaml:"completed_task_ttl"` // TTL for completed/failed task keys in Redis (default: 24h, "0" = no expiry)
+	Queue           string   `yaml:"queue"`   // DEPRECATED: Single queue name (backward compat)
+	Queues          []string `yaml:"queues"`  // List of queue names to listen on
+	Concurrency     int      `yaml:"concurrency"`
+	ShutdownTimeout string   `yaml:"shutdown_timeout"`
+
+	// Task lifecycle fallback defaults (per-task server values take priority). "0" = disabled / no expiry.
+	TTLCompleted     string `yaml:"ttl_completed"`      // TTL for completed task keys (default: 24h)
+	TTLArchived      string `yaml:"ttl_archived"`       // TTL for failed/archived task keys (default: 72h)
+	PendingTimeout   string `yaml:"pending_timeout"`    // Max age in pending before archive (default: 0)
+	ActiveTimeout    string `yaml:"active_timeout"`     // Max execution time before retriable timeout (default: 0)
+	CompletedTaskTTL string `yaml:"completed_task_ttl"` // DEPRECATED alias of ttl_completed
 }
 
 // RetryConfig holds retry settings from YAML.
@@ -117,7 +123,10 @@ func LoadConfig(path string) (*Config, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Fall back to environment variables
-			cfg := loadConfigFromEnv()
+			cfg, cerr := loadConfigFromEnv()
+			if cerr != nil {
+				return nil, cerr
+			}
 			return &cfg, nil
 		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
@@ -131,8 +140,24 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	cfg := toWorkerConfig(&yc)
+	cfg, err := toWorkerConfig(&yc)
+	if err != nil {
+		return nil, err
+	}
 	return &cfg, nil
+}
+
+// parseLifecycleDur parses a non-empty task-lifecycle duration value, rejecting malformed or
+// negative input so misconfiguration fails fast instead of being silently ignored.
+func parseLifecycleDur(name, val string) (time.Duration, error) {
+	d, err := time.ParseDuration(val)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q (use forms like \"24h\", \"90s\", \"0\"): %w", name, val, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s must be >= 0, got %q", name, val)
+	}
+	return d, nil
 }
 
 // loadConfigFromEnv builds configuration purely from environment variables.
@@ -148,7 +173,7 @@ func LoadConfig(path string) (*Config, error) {
 //   - RUNQY_GIT_TOKEN: Git personal access token
 //   - RUNQY_DEPLOYMENT_DIR: Code deployment directory (default: ./deployment)
 //   - RUNQY_MAX_RETRY: Max task retry attempts (default: 25)
-func loadConfigFromEnv() Config {
+func loadConfigFromEnv() (Config, error) {
 	cfg := DefaultConfig()
 
 	// Server settings (required)
@@ -175,6 +200,36 @@ func loadConfigFromEnv() Config {
 	if timeout := os.Getenv("RUNQY_SHUTDOWN_TIMEOUT"); timeout != "" {
 		if d, err := time.ParseDuration(timeout); err == nil {
 			cfg.ShutdownTimeout = d
+		}
+	}
+	// Task lifecycle fallback defaults. "0" disables expiry/timeout; invalid values are rejected.
+	ttlCompletedEnv, ttlCompletedName := os.Getenv("RUNQY_TTL_COMPLETED"), "RUNQY_TTL_COMPLETED"
+	if ttlCompletedEnv == "" {
+		if alias := os.Getenv("RUNQY_COMPLETED_TASK_TTL"); alias != "" { // deprecated alias
+			ttlCompletedEnv, ttlCompletedName = alias, "RUNQY_COMPLETED_TASK_TTL"
+		}
+	}
+	if ttlCompletedEnv != "" {
+		d, err := parseLifecycleDur(ttlCompletedName, ttlCompletedEnv)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.TTLCompleted = d
+	}
+	for _, e := range []struct {
+		env   string
+		field *time.Duration
+	}{
+		{"RUNQY_TTL_ARCHIVED", &cfg.TTLArchived},
+		{"RUNQY_PENDING_TIMEOUT", &cfg.PendingTimeout},
+		{"RUNQY_ACTIVE_TIMEOUT", &cfg.ActiveTimeout},
+	} {
+		if v := os.Getenv(e.env); v != "" {
+			d, err := parseLifecycleDur(e.env, v)
+			if err != nil {
+				return cfg, err
+			}
+			*e.field = d
 		}
 	}
 
@@ -246,7 +301,7 @@ func loadConfigFromEnv() Config {
 		}
 	}
 
-	return cfg
+	return cfg, nil
 }
 
 // expandEnvVars replaces ${VAR} and ${VAR:-default} patterns with environment variable values.
@@ -273,7 +328,7 @@ func expandEnvVars(data []byte) []byte {
 }
 
 // toWorkerConfig converts YAMLConfig to the internal Config struct.
-func toWorkerConfig(yc *YAMLConfig) Config {
+func toWorkerConfig(yc *YAMLConfig) (Config, error) {
 	cfg := DefaultConfig()
 
 	// Server settings (required)
@@ -298,9 +353,33 @@ func toWorkerConfig(yc *YAMLConfig) Config {
 			cfg.ShutdownTimeout = d
 		}
 	}
-	if yc.Worker.CompletedTaskTTL != "" {
-		if d, err := time.ParseDuration(yc.Worker.CompletedTaskTTL); err == nil {
-			cfg.CompletedTaskTTL = d
+	// Task lifecycle fallback defaults. completed_task_ttl is a deprecated alias of ttl_completed.
+	// Invalid durations are rejected rather than silently ignored.
+	ttlCompletedVal, ttlCompletedName := yc.Worker.TTLCompleted, "worker.ttl_completed"
+	if ttlCompletedVal == "" && yc.Worker.CompletedTaskTTL != "" {
+		ttlCompletedVal, ttlCompletedName = yc.Worker.CompletedTaskTTL, "worker.completed_task_ttl"
+	}
+	if ttlCompletedVal != "" {
+		d, err := parseLifecycleDur(ttlCompletedName, ttlCompletedVal)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.TTLCompleted = d
+	}
+	for _, f := range []struct {
+		name, val string
+		field     *time.Duration
+	}{
+		{"worker.ttl_archived", yc.Worker.TTLArchived, &cfg.TTLArchived},
+		{"worker.pending_timeout", yc.Worker.PendingTimeout, &cfg.PendingTimeout},
+		{"worker.active_timeout", yc.Worker.ActiveTimeout, &cfg.ActiveTimeout},
+	} {
+		if f.val != "" {
+			d, err := parseLifecycleDur(f.name, f.val)
+			if err != nil {
+				return cfg, err
+			}
+			*f.field = d
 		}
 	}
 
@@ -358,5 +437,5 @@ func toWorkerConfig(yc *YAMLConfig) Config {
 		}
 	}
 
-	return cfg
+	return cfg, nil
 }

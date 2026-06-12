@@ -41,8 +41,15 @@ type Config struct {
 	RetryDelayFunc func(n int, err error, t *Task) time.Duration // Custom backoff (optional)
 
 	// Timeouts
-	ShutdownTimeout   time.Duration // Time to wait for graceful shutdown (default: 8s)
-	CompletedTaskTTL  time.Duration // TTL for completed/failed task keys in Redis (default: 24h, 0 = no expiry)
+	ShutdownTimeout time.Duration // Time to wait for graceful shutdown (default: 8s)
+
+	// Task lifecycle fallback defaults. The per-task values stamped by the server (read from
+	// the task hash at dequeue) take priority; these apply only when a task lacks the field
+	// (old tasks, or tasks enqueued outside the server). 0 = disabled / no expiry.
+	TTLCompleted   time.Duration // TTL for successfully completed task keys (default: 24h)
+	TTLArchived    time.Duration // TTL for failed/archived task keys (default: 72h)
+	PendingTimeout time.Duration // Max age in :pending before archive-on-dequeue (default: 0 = disabled)
+	ActiveTimeout  time.Duration // Max execution time before a retriable timeout (default: 0 = disabled)
 
 	// Lease settings
 	// A task's lease is set at dequeue and periodically renewed by the worker while it
@@ -81,8 +88,11 @@ func DefaultConfig() Config {
 		Concurrency:     1,
 		Queues:          map[string]int{"default": 1},
 		MaxRetry:        25,
-		ShutdownTimeout:  8 * time.Second,
-		CompletedTaskTTL: 24 * time.Hour,
+		ShutdownTimeout: 8 * time.Second,
+		TTLCompleted:    24 * time.Hour,
+		TTLArchived:     72 * time.Hour,
+		PendingTimeout:  0,
+		ActiveTimeout:   0,
 
 		// Lease defaults
 		LeaseDuration:       2 * time.Minute,

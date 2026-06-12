@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"io"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -15,6 +16,14 @@ type Task struct {
 	retry    int
 	maxRetry int
 	queue    string // The queue this task was dequeued from
+
+	// Per-task lifecycle values stamped by the server (negative Duration = absent, the
+	// processor falls back to its config default; 0 = explicitly disabled / no expiry).
+	pendingSince   int64         // unix seconds when the task entered pending (0 = unknown)
+	ttlCompleted   time.Duration // -1 = absent
+	ttlArchived    time.Duration // -1 = absent
+	pendingTimeout time.Duration // -1 = absent
+	activeTimeout  time.Duration // -1 = absent
 
 	// For result writing
 	rdb     *redis.Client
