@@ -98,6 +98,10 @@ type WorkerConfig struct {
 	Concurrency     int      `yaml:"concurrency"`
 	ShutdownTimeout string   `yaml:"shutdown_timeout"`
 
+	// Autoscaling correlation (optional)
+	InstanceID string `yaml:"instance_id"` // Opaque id the autoscaler assigns to the cloud instance
+	Protected  bool   `yaml:"protected"`   // When true, worker declares itself protected from autoscaling teardown
+
 	// Task lifecycle fallback defaults (per-task server values take priority). "0" = disabled / no expiry.
 	TTLCompleted     string `yaml:"ttl_completed"`      // TTL for completed task keys (default: 24h)
 	TTLArchived      string `yaml:"ttl_archived"`       // TTL for failed/archived task keys (default: 72h)
@@ -173,6 +177,8 @@ func parseLifecycleDur(name, val string) (time.Duration, error) {
 //   - RUNQY_GIT_TOKEN: Git personal access token
 //   - RUNQY_DEPLOYMENT_DIR: Code deployment directory (default: ./deployment)
 //   - RUNQY_MAX_RETRY: Max task retry attempts (default: 25)
+//   - RUNQY_INSTANCE_ID: Opaque cloud instance id for autoscaler correlation (optional)
+//   - RUNQY_PROTECTED: Declare worker protected from autoscaling teardown (default: false)
 func loadConfigFromEnv() (Config, error) {
 	cfg := DefaultConfig()
 
@@ -201,6 +207,12 @@ func loadConfigFromEnv() (Config, error) {
 		if d, err := time.ParseDuration(timeout); err == nil {
 			cfg.ShutdownTimeout = d
 		}
+	}
+
+	// Autoscaling correlation (optional)
+	cfg.InstanceID = os.Getenv("RUNQY_INSTANCE_ID")
+	if protected := os.Getenv("RUNQY_PROTECTED"); protected != "" {
+		cfg.Protected = strings.ToLower(protected) == "true" || protected == "1"
 	}
 	// Task lifecycle fallback defaults. "0" disables expiry/timeout; invalid values are rejected.
 	ttlCompletedEnv, ttlCompletedName := os.Getenv("RUNQY_TTL_COMPLETED"), "RUNQY_TTL_COMPLETED"
@@ -353,6 +365,11 @@ func toWorkerConfig(yc *YAMLConfig) (Config, error) {
 			cfg.ShutdownTimeout = d
 		}
 	}
+	// Autoscaling correlation (optional)
+	if yc.Worker.InstanceID != "" {
+		cfg.InstanceID = yc.Worker.InstanceID
+	}
+	cfg.Protected = yc.Worker.Protected
 	// Task lifecycle fallback defaults. completed_task_ttl is a deprecated alias of ttl_completed.
 	// Invalid durations are rejected rather than silently ignored.
 	ttlCompletedVal, ttlCompletedName := yc.Worker.TTLCompleted, "worker.ttl_completed"
