@@ -36,6 +36,10 @@ type Config struct {
 	Concurrency int            // Max parallel tasks (default: 1)
 	Queues      map[string]int // Queue name -> priority weight (populated by bootstrap)
 
+	// Autoscaling correlation (optional)
+	InstanceID string // Optional: opaque id the autoscaler assigns to the cloud instance. Default empty.
+	Protected  bool   // Optional: when true, the worker declares itself protected from autoscaling teardown. Default false.
+
 	// Retry settings
 	MaxRetry       int                                           // Max retry attempts (default: 25)
 	RetryDelayFunc func(n int, err error, t *Task) time.Duration // Custom backoff (optional)

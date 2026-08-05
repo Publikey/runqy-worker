@@ -166,6 +166,12 @@ func (h *heartbeat) register(ctx context.Context) {
 		"queues":      fmt.Sprintf("%v", h.config.Queues),
 		"status":      h.getStatus(),
 		"healthy":     h.isHealthy(),
+		"protected":   fmt.Sprintf("%v", h.config.Protected),
+	}
+
+	// Autoscaling correlation: only write instance_id when set to avoid clutter.
+	if h.config.InstanceID != "" {
+		data["instance_id"] = h.config.InstanceID
 	}
 
 	// Attach system metrics
@@ -202,6 +208,12 @@ func (h *heartbeat) beat(ctx context.Context) {
 		"worker_id":   h.workerID,
 		"queues":      fmt.Sprintf("%v", h.config.Queues),
 		"concurrency": h.config.Concurrency,
+		"protected":   fmt.Sprintf("%v", h.config.Protected),
+	}
+
+	// Autoscaling correlation: only write instance_id when set to avoid clutter.
+	if h.config.InstanceID != "" {
+		beatData["instance_id"] = h.config.InstanceID
 	}
 
 	// Attach system metrics
