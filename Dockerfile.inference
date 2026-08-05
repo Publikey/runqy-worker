@@ -1,7 +1,14 @@
 # Inference-ready image with Python3, pip, virtualenv, and build tools
 # Supports workers that require compilation (llama-cpp-python, etc.)
+#
+# torch 2.12: required by the minimax-h3-im-engine worker (diffusers PR #14355
+# imports torch.nn.functional.ScalingType, absent before 2.12). Validated pair
+# 2026-08-05: torch 2.12.0+cu126 / torchvision 0.27.0+cu126. ROLLOUT: the
+# release built from this base serves the H3 pods only for now — image/wan
+# workers stay on the previous release (their stack was validated on torch
+# 2.7.1) until the fleet revalidates on 2.12 deliberately.
 
-FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+FROM pytorch/pytorch:2.12.0-cuda12.6-cudnn9-runtime
 
 ARG TARGETOS
 ARG TARGETARCH
