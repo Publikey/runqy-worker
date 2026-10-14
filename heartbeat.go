@@ -28,6 +28,9 @@ type heartbeat struct {
 
 	logBuffer  *LogBuffer // log buffer for streaming logs to Redis
 	lastLogSeq uint64     // last flushed log sequence number
+
+	activityFn func() (active int, lastTaskAt time.Time) // processor activity (nil until processing starts)
+	activityMu sync.RWMutex
 }
 
 // newHeartbeat creates a new heartbeat sender.
@@ -216,6 +219,10 @@ func (h *heartbeat) beat(ctx context.Context) {
 		beatData["instance_id"] = h.config.InstanceID
 	}
 
+	// Per-worker activity, so the autoscaler can measure idleness per instance and never
+	// destroy one that is mid-task.
+	h.addActivity(beatData)
+
 	// Attach system metrics
 	if m, err := collectMetrics(); err == nil {
 		if b, err := json.Marshal(m); err == nil {
@@ -343,4 +350,27 @@ func encodeQueues(queues map[string]int) string {
 		return "{}"
 	}
 	return string(b)
+}
+
+// setActivitySource wires the processor's activity reporter into the heartbeat.
+func (h *heartbeat) setActivitySource(fn func() (active int, lastTaskAt time.Time)) {
+	h.activityMu.Lock()
+	h.activityFn = fn
+	h.activityMu.Unlock()
+}
+
+// addActivity adds "active" (in-flight task count) and, once a task has run,
+// "last_task_at" (unix seconds) to the heartbeat fields.
+func (h *heartbeat) addActivity(data map[string]interface{}) {
+	h.activityMu.RLock()
+	fn := h.activityFn
+	h.activityMu.RUnlock()
+	if fn == nil {
+		return
+	}
+	active, last := fn()
+	data["active"] = active
+	if !last.IsZero() {
+		data["last_task_at"] = last.Unix()
+	}
 }
