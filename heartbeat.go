@@ -163,7 +163,7 @@ func (h *heartbeat) register(ctx context.Context) {
 		"started_at":  now,
 		"last_beat":   now,
 		"concurrency": h.config.Concurrency,
-		"queues":      fmt.Sprintf("%v", h.config.Queues),
+		"queues":      encodeQueues(h.config.Queues),
 		"status":      h.getStatus(),
 		"healthy":     h.isHealthy(),
 		"protected":   fmt.Sprintf("%v", h.config.Protected),
@@ -206,7 +206,7 @@ func (h *heartbeat) beat(ctx context.Context) {
 		"status":      h.getStatus(),
 		"healthy":     healthy,
 		"worker_id":   h.workerID,
-		"queues":      fmt.Sprintf("%v", h.config.Queues),
+		"queues":      encodeQueues(h.config.Queues),
 		"concurrency": h.config.Concurrency,
 		"protected":   fmt.Sprintf("%v", h.config.Protected),
 	}
@@ -329,4 +329,18 @@ func (h *heartbeat) updateClient(client *redis.Client) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	h.register(ctx)
+}
+
+// encodeQueues serializes the queue -> priority map as JSON for the heartbeat
+// "queues" field (e.g. {"inference.high":10,"inference.low":1}). Readers also
+// accept the legacy Go "%v" format ("map[inference.high:10 ...]") from older workers.
+func encodeQueues(queues map[string]int) string {
+	if queues == nil {
+		return "{}"
+	}
+	b, err := json.Marshal(queues)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
