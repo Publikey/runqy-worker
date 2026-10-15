@@ -43,6 +43,7 @@ const (
 	KeyRetry      = KeyPrefix + "{%s}:retry"     // Sorted set of retry task IDs (score = retry time)
 	KeyCompleted  = KeyPrefix + "{%s}:completed" // Sorted set of completed task IDs
 	KeyArchived   = KeyPrefix + "{%s}:archived"  // Sorted set of failed/archived task IDs
+	KeyPaused     = KeyPrefix + "{%s}:paused"    // Exists while the queue is paused (runqy queue pause / dashboard)
 	KeyTask       = KeyPrefix + "{%s}:t:%s"      // Task data hash: asynq:{queue}:t:{taskID}
 	KeyTaskLookup = KeyPrefix + "t:%s"           // Reverse-lookup hash (task_id -> queue), written by the server; NOT queue-scoped/hash-tagged
 	KeyWorkers    = KeyPrefix + "workers"        // Set of worker IDs
@@ -96,8 +97,8 @@ type TaskData struct {
 	ID       string
 	Type     string
 	Payload  []byte
-	Retry    int    // Current retry count
-	MaxRetry int    // Maximum retry attempts
+	Retry    int // Current retry count
+	MaxRetry int // Maximum retry attempts
 	Queue    string
 	TaskKey  string // The task hash key: asynq:{queue}:t:{taskID}
 
@@ -282,15 +283,50 @@ func appendVarint(buf []byte, val uint64) []byte {
 	return buf
 }
 
+// unpausedQueues returns the queues that are not paused, keeping their order (which
+// carries the priority weighting). One pipelined EXISTS per queue.
+func (r *Client) unpausedQueues(ctx context.Context, queues []string) ([]string, error) {
+	pipe := r.Rdb.Pipeline()
+	cmds := make([]*redis.IntCmd, len(queues))
+	for i, q := range queues {
+		cmds[i] = pipe.Exists(ctx, fmt.Sprintf(KeyPaused, q))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, fmt.Errorf("check paused queues: %w", err)
+	}
+	out := make([]string, 0, len(queues))
+	for i, q := range queues {
+		if cmds[i].Val() == 0 {
+			out = append(out, q)
+		}
+	}
+	return out, nil
+}
+
 // Dequeue attempts to dequeue a task from the given queues using BRPOP.
 // This is compatible with asynq's list-based pending queue.
 // leaseDuration sets how long the task's lease is valid before it must be
 // renewed (see ExtendLease); the worker renews it periodically while processing.
 // Returns nil if no task is available.
 func (r *Client) Dequeue(ctx context.Context, queues []string, leaseDuration time.Duration) (*TaskData, error) {
+	// Skip paused queues (asynq:{q}:paused, set by `runqy queue pause` and the dashboard).
+	active, err := r.unpausedQueues(ctx, queues)
+	if err != nil {
+		return nil, err
+	}
+	if len(active) == 0 {
+		// Everything is paused: wait like an empty BRPOP would, instead of spinning.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+		return nil, nil
+	}
+
 	// Build list of pending queue keys
-	keys := make([]string, len(queues))
-	for i, q := range queues {
+	keys := make([]string, len(active))
+	for i, q := range active {
 		keys[i] = fmt.Sprintf(KeyPending, q)
 	}
 
