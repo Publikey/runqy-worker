@@ -1,0 +1,92 @@
+name: Staging worker image
+
+# Builds the inference worker image from the `dev` branch and pushes it to GHCR under
+# staging tags, so rented GPU machines (RunPod, Vast.ai) can pull the code under test
+# without credentials:
+#   ghcr.io/publikey/runqy-worker:staging-inference          (latest dev build)
+#   ghcr.io/publikey/runqy-worker:staging-inference-<sha7>   (pinned build)
+# Release tags (vX.Y.Z, inference, latest) are untouched: they come from release.yml.
+on:
+  push:
+    branches: [ dev ]
+  workflow_dispatch:
+
+concurrency:
+  group: staging-worker-image
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/publikey/runqy-worker
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # Same binary as the release (see .goreleaser.yml), placed where
+      # Dockerfile.inference expects it: ${TARGETOS}/${TARGETARCH}/runqy-worker.
+      - name: Build worker binary (linux/amd64)
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p linux/amd64
+          go build -ldflags "-s -w -X main.Version=staging-${GITHUB_SHA::7} -X main.Commit=${GITHUB_SHA} -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o linux/amd64/runqy-worker ./cmd/worker
+
+      # The CUDA/PyTorch base image is large: make room on the runner.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push inference image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.inference
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:staging-inference
+            ${{ env.IMAGE }}:staging-inference-${{ steps.sha.outputs.short }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=staging-${{ steps.sha.outputs.short }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### Staging worker image"
+            echo "- \`${IMAGE}:staging-inference\`"
+            echo "- \`${IMAGE}:staging-inference-${{ steps.sha.outputs.short }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
