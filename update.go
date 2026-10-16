@@ -104,8 +104,9 @@ func downloadRelease(ctx context.Context, base, version, dest string) error {
 	want := ""
 	sc := bufio.NewScanner(strings.NewReader(string(sums)))
 	for sc.Scan() {
+		// "<sha256>  <file>" (goreleaser) or "<sha256> *<file>" (sha256sum binary mode).
 		fields := strings.Fields(sc.Text())
-		if len(fields) == 2 && fields[1] == archive {
+		if len(fields) == 2 && strings.TrimPrefix(fields[1], "*") == archive {
 			want = strings.ToLower(fields[0])
 		}
 	}

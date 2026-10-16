@@ -161,6 +161,12 @@ func TestDownloadRelease(t *testing.T) {
 		t.Fatalf("extracted binary = %q", got)
 	}
 
+	// sha256sum's binary-mode marker ("<sum> *<file>") is accepted too.
+	checksums = hex.EncodeToString(sum[:]) + " *" + name + "\r\n"
+	if err := downloadRelease(context.Background(), srv.URL, "9.9.9", dest); err != nil {
+		t.Fatalf("binary-mode checksums: %v", err)
+	}
+
 	// A tampered archive is refused.
 	checksums = strings.Repeat("0", 64) + "  " + name + "\n"
 	if err := downloadRelease(context.Background(), srv.URL, "9.9.9", dest); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
