@@ -32,6 +32,7 @@ type processor struct {
 	// Used to renew leases while processing and to requeue leftovers on shutdown.
 	inflight   map[string]string
 	inflightMu sync.Mutex
+	lastTaskAt time.Time // last time a task started or finished (guarded by inflightMu)
 
 	// Lease extender lifecycle.
 	leaseDone chan struct{}
@@ -61,6 +62,7 @@ func newProcessor(rdb *redisClient, handler Handler, cfg Config) *processor {
 func (p *processor) trackInflight(taskID, queueName string) {
 	p.inflightMu.Lock()
 	p.inflight[taskID] = queueName
+	p.lastTaskAt = time.Now()
 	p.inflightMu.Unlock()
 }
 
@@ -68,6 +70,7 @@ func (p *processor) trackInflight(taskID, queueName string) {
 func (p *processor) untrackInflight(taskID string) {
 	p.inflightMu.Lock()
 	delete(p.inflight, taskID)
+	p.lastTaskAt = time.Now()
 	p.inflightMu.Unlock()
 }
 
@@ -80,6 +83,14 @@ func (p *processor) snapshotInflight() map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// activity reports the number of in-flight tasks and when a task last started or
+// finished (zero if none yet). Published in the heartbeat for the autoscaler.
+func (p *processor) activity() (active int, lastTaskAt time.Time) {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	return len(p.inflight), p.lastTaskAt
 }
 
 // SetQueueHandler sets the handler for a specific queue.
