@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -95,6 +96,16 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 		if _, err := os.Stat(gitDir); err == nil {
 			logger.Info("Existing deployment found at %s, pulling latest changes...", deployDir)
 
+			// Point origin at the current token so a rotated token (or the older
+			// token-only URL form) does not break the pull.
+			if config.GitSSHKey == "" && config.GitToken != "" {
+				setURL := exec.CommandContext(ctx, "git", "remote", "set-url", "origin", EmbedTokenInURL(spec.GitURL, config.GitToken))
+				setURL.Dir = deployDir
+				if out, err := setURL.CombinedOutput(); err != nil {
+					logger.Warn("Failed to update origin URL: %v\nOutput: %s", err, redactToken(string(out), config.GitToken))
+				}
+			}
+
 			// Pull latest changes to ensure worker runs up-to-date code
 			pullArgs := []string{"pull", "--ff-only"}
 			pullCmd := exec.CommandContext(ctx, "git", pullArgs...)
@@ -102,7 +113,7 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 			pullCmd.Env = gitEnv(config, spec)
 
 			if pullOutput, pullErr := pullCmd.CombinedOutput(); pullErr != nil {
-				logger.Warn("Git pull failed (continuing with existing code): %v\nOutput: %s", pullErr, string(pullOutput))
+				logger.Warn("Git pull failed (continuing with existing code): %v\nOutput: %s", pullErr, redactToken(string(pullOutput), config.GitToken))
 			} else {
 				logger.Info("Git pull successful")
 			}
@@ -144,7 +155,7 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 
 	// Use sparse checkout if CodePath is specified
 	if spec.CodePath != "" {
-		return gitCloneSparse(ctx, deployDir, parentDir, spec, gitURL, env, logger)
+		return gitCloneSparse(ctx, deployDir, parentDir, spec, gitURL, gitToken, env, logger)
 	}
 
 	// Regular clone (no CodePath)
@@ -160,7 +171,7 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 	if err != nil {
 		// Clean up on failure
 		os.RemoveAll(deployDir)
-		return "", fmt.Errorf("git clone failed: %w\nOutput: %s", err, string(output))
+		return "", fmt.Errorf("git clone failed: %w\nOutput: %s", err, redactToken(string(output), gitToken))
 	}
 
 	logger.Info("Git clone successful")
@@ -168,7 +179,7 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 }
 
 // gitCloneSparse performs a sparse checkout to only download the specified subdirectory.
-func gitCloneSparse(ctx context.Context, deployDir, parentDir string, spec DeploymentConfig, gitURL string, env []string, logger Logger) (string, error) {
+func gitCloneSparse(ctx context.Context, deployDir, parentDir string, spec DeploymentConfig, gitURL, gitToken string, env []string, logger Logger) (string, error) {
 
 	repoURL := gitURL
 
@@ -186,8 +197,9 @@ func gitCloneSparse(ctx context.Context, deployDir, parentDir string, spec Deplo
 		deployDir = filepath.Join(parentDir, deployDir)
 	}
 
+	// Log the URL as configured: repoURL may carry the token.
 	logger.Info("Sparse checkout: cloning %s (branch: %s, path: %s) to %s",
-		repoURL, spec.Branch, spec.CodePath, deployDir)
+		spec.GitURL, spec.Branch, spec.CodePath, deployDir)
 
 	// Step 1: Clone with filter (no blobs) and sparse mode
 	args := []string{
@@ -207,7 +219,7 @@ func gitCloneSparse(ctx context.Context, deployDir, parentDir string, spec Deplo
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		os.RemoveAll(deployDir)
-		return "", fmt.Errorf("git sparse clone failed: %w\nOutput: %s", err, string(output))
+		return "", fmt.Errorf("git sparse clone failed: %w\nOutput: %s", err, redactToken(string(output), gitToken))
 	}
 
 	// Step 2: Some git versions need init before set
@@ -224,25 +236,51 @@ func gitCloneSparse(ctx context.Context, deployDir, parentDir string, spec Deplo
 	setOut, err := setCmd.CombinedOutput()
 	if err != nil {
 		os.RemoveAll(deployDir)
-		return "", fmt.Errorf("git sparse-checkout set failed: %w\nOutput: %s", err, string(setOut))
+		return "", fmt.Errorf("git sparse-checkout set failed: %w\nOutput: %s", err, redactToken(string(setOut), gitToken))
 	}
 
 	logger.Info("Sparse checkout successful (only downloaded: %s)", spec.CodePath)
 	return deployDir, nil
 }
 
-// EmbedTokenInURL embeds a token into a git URL for authentication.
+// gitTokenUser is the username sent with a bare token (GitHub ignores it for token auth).
+// Other hosts that need a specific username take the token as user:password.
+const gitTokenUser = "x-access-token"
+
+// EmbedTokenInURL embeds a token into an HTTP(S) git URL for authentication, as
+// https://x-access-token:<token>@host/... A token containing ':' is taken as user:password.
+// Any credentials already in the URL are replaced; SSH and other URLs are returned unchanged.
+//
+// The token goes in the password slot: a token-only username (https://<token>@host) breaks
+// with Ubuntu's curl 8.5.0-2ubuntu10.16, which loses it when GitHub redirects the request.
 func EmbedTokenInURL(gitURL, token string) string {
-	// Handle HTTPS URLs: https://github.com/user/repo.git -> https://token@github.com/user/repo.git
-	if strings.HasPrefix(gitURL, "https://") {
-		return "https://" + token + "@" + strings.TrimPrefix(gitURL, "https://")
+	token = strings.TrimSpace(token)
+	if token == "" || !(strings.HasPrefix(gitURL, "https://") || strings.HasPrefix(gitURL, "http://")) {
+		return gitURL
 	}
-	// Handle HTTP URLs (not recommended but supported)
-	if strings.HasPrefix(gitURL, "http://") {
-		return "http://" + token + "@" + strings.TrimPrefix(gitURL, "http://")
+	u, err := url.Parse(gitURL)
+	if err != nil {
+		return gitURL
 	}
-	// Return unchanged for SSH URLs (token auth doesn't apply)
-	return gitURL
+	if user, pass, ok := strings.Cut(token, ":"); ok {
+		u.User = url.UserPassword(user, pass)
+	} else {
+		u.User = url.UserPassword(gitTokenUser, token)
+	}
+	return u.String()
+}
+
+// redactToken hides a git token (raw and URL-escaped) in git output before it is logged.
+func redactToken(s, token string) string {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return s
+	}
+	s = strings.ReplaceAll(s, token, "***")
+	if esc := url.QueryEscape(token); esc != token {
+		s = strings.ReplaceAll(s, esc, "***")
+	}
+	return s
 }
 
 // packageManager represents the detected Python package manager.

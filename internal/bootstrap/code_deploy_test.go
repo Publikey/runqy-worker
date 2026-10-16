@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -17,13 +18,13 @@ func TestEmbedTokenInURL(t *testing.T) {
 			name:     "https url",
 			gitURL:   "https://github.com/user/repo.git",
 			token:    "ghp_token123",
-			expected: "https://ghp_token123@github.com/user/repo.git",
+			expected: "https://x-access-token:ghp_token123@github.com/user/repo.git",
 		},
 		{
 			name:     "http url",
 			gitURL:   "http://github.com/user/repo.git",
 			token:    "token123",
-			expected: "http://token123@github.com/user/repo.git",
+			expected: "http://x-access-token:token123@github.com/user/repo.git",
 		},
 		{
 			name:     "ssh url unchanged",
@@ -32,10 +33,28 @@ func TestEmbedTokenInURL(t *testing.T) {
 			expected: "git@github.com:user/repo.git",
 		},
 		{
-			name:     "https with existing auth",
+			name:     "existing credentials replaced",
 			gitURL:   "https://oldtoken@github.com/user/repo.git",
 			token:    "newtoken",
-			expected: "https://newtoken@oldtoken@github.com/user/repo.git",
+			expected: "https://x-access-token:newtoken@github.com/user/repo.git",
+		},
+		{
+			name:     "user:password token",
+			gitURL:   "https://gitlab.com/user/repo.git",
+			token:    "oauth2:glpat-abc",
+			expected: "https://oauth2:glpat-abc@gitlab.com/user/repo.git",
+		},
+		{
+			name:     "surrounding whitespace trimmed",
+			gitURL:   "https://github.com/user/repo.git",
+			token:    " ghp_token123\n",
+			expected: "https://x-access-token:ghp_token123@github.com/user/repo.git",
+		},
+		{
+			name:     "empty token unchanged",
+			gitURL:   "https://github.com/user/repo.git",
+			token:    "",
+			expected: "https://github.com/user/repo.git",
 		},
 	}
 
@@ -46,6 +65,17 @@ func TestEmbedTokenInURL(t *testing.T) {
 				t.Errorf("EmbedTokenInURL(%q, %q) = %q, want %q", tt.gitURL, tt.token, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestRedactToken(t *testing.T) {
+	out := "fatal: unable to access 'https://x-access-token:ghp_secret@github.com/user/repo.git/'"
+	got := redactToken(out, "ghp_secret")
+	if strings.Contains(got, "ghp_secret") {
+		t.Errorf("token not redacted: %q", got)
+	}
+	if redactToken(out, "") != out {
+		t.Error("empty token must leave output unchanged")
 	}
 }
 
