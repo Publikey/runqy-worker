@@ -23,6 +23,17 @@ type DeploymentResult struct {
 // DeployCode clones a git repository, creates a Python virtual environment,
 // and installs dependencies.
 func DeployCode(ctx context.Context, config Config, spec DeploymentConfig, logger Logger) (*DeploymentResult, error) {
+	return deploy(ctx, config, spec, logger, false)
+}
+
+// UpdateCode brings an existing deployment to the latest commit of spec.Branch (fetch
+// + forced checkout, so a branch change or a force push is followed) and reinstalls the
+// dependencies. Unlike DeployCode, a failed git update is an error, not a warning.
+func UpdateCode(ctx context.Context, config Config, spec DeploymentConfig, logger Logger) (*DeploymentResult, error) {
+	return deploy(ctx, config, spec, logger, true)
+}
+
+func deploy(ctx context.Context, config Config, spec DeploymentConfig, logger Logger, strict bool) (*DeploymentResult, error) {
 	deployDir := config.DeploymentDir
 	if deployDir == "" {
 		deployDir = "./deployment"
@@ -35,7 +46,7 @@ func DeployCode(ctx context.Context, config Config, spec DeploymentConfig, logge
 	}
 
 	// Phase 1: Git Clone (with sparse checkout if CodePath is set)
-	repoPath, err := gitClone(ctx, absDeployDir, spec, config, logger)
+	repoPath, err := gitClone(ctx, absDeployDir, spec, config, logger, strict)
 	if err != nil {
 		return nil, fmt.Errorf("git clone failed: %w", err)
 	}
@@ -87,13 +98,16 @@ func gitEnv(config Config, spec DeploymentConfig) []string {
 
 // gitClone clones the repository or reuses existing deployment.
 // If spec.CodePath is set, uses sparse checkout to only download that subdirectory.
-func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, config Config, logger Logger) (string, error) {
+func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, config Config, logger Logger, strict bool) (string, error) {
 	// Check if deployment directory exists
 	info, err := os.Stat(deployDir)
 	if err == nil && info.IsDir() {
 		// Directory exists - check for .git
 		gitDir := filepath.Join(deployDir, ".git")
 		if _, err := os.Stat(gitDir); err == nil {
+			if strict {
+				return deployDir, gitRefresh(ctx, deployDir, spec, config, logger)
+			}
 			logger.Info("Existing deployment found at %s, pulling latest changes...", deployDir)
 
 			// Point origin at the current token so a rotated token (or the older
@@ -176,6 +190,38 @@ func gitClone(ctx context.Context, deployDir string, spec DeploymentConfig, conf
 
 	logger.Info("Git clone successful")
 	return deployDir, nil
+}
+
+// gitRefresh moves an existing clone to the tip of spec.Branch: origin is re-pointed at
+// the current URL and token, then the branch is fetched (shallow) and force-checked
+// out. Untracked files (the virtualenv) are kept; sparse checkout settings too.
+func gitRefresh(ctx context.Context, deployDir string, spec DeploymentConfig, config Config, logger Logger) error {
+	token := ""
+	originURL := spec.GitURL
+	if config.GitSSHKey == "" && config.GitToken != "" {
+		token = config.GitToken
+		originURL = EmbedTokenInURL(spec.GitURL, token)
+	}
+	steps := [][]string{
+		{"remote", "set-url", "origin", originURL},
+		{"fetch", "--depth", "1", "origin", spec.Branch},
+		{"checkout", "-f", "-B", spec.Branch, "FETCH_HEAD"},
+	}
+	logger.Info("Updating %s to the latest %s (branch: %s)...", deployDir, spec.GitURL, spec.Branch)
+	for _, args := range steps {
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = deployDir
+		cmd.Env = gitEnv(config, spec)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("git %s failed: %w\nOutput: %s", args[0], err, redactToken(string(out), token))
+		}
+	}
+	rev := exec.CommandContext(ctx, "git", "rev-parse", "--short", "HEAD")
+	rev.Dir = deployDir
+	if out, err := rev.Output(); err == nil {
+		logger.Info("Code updated to %s", strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // gitCloneSparse performs a sparse checkout to only download the specified subdirectory.

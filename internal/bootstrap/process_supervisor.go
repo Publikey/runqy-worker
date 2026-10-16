@@ -40,6 +40,10 @@ type ProcessSupervisor struct {
 	restartCount int
 	lastRestart  time.Time
 
+	// capabilities announced by the process in its ready signal
+	// ({"status":"ready","capabilities":["reload"]}); older SDKs announce none.
+	capabilities []string
+
 	done chan struct{}
 }
 
@@ -162,11 +166,15 @@ func (s *ProcessSupervisor) waitForReady(ctx context.Context, timeout time.Durat
 
 			// Try to parse as JSON status message
 			var status struct {
-				Status string `json:"status"`
-				Error  string `json:"error"`
+				Status       string   `json:"status"`
+				Error        string   `json:"error"`
+				Capabilities []string `json:"capabilities"`
 			}
 			if err := json.Unmarshal([]byte(line), &status); err == nil {
 				if status.Status == "ready" {
+					s.mu.Lock()
+					s.capabilities = status.Capabilities
+					s.mu.Unlock()
 					close(readyCh)
 					return
 				}
@@ -409,6 +417,19 @@ func (s *ProcessSupervisor) Restart(ctx context.Context) error {
 
 	s.logger.Info("Process restarted successfully (total restarts: %d)", s.restartCount)
 	return nil
+}
+
+// HasCapability reports whether the running process announced the capability (e.g.
+// "reload") in its ready signal.
+func (s *ProcessSupervisor) HasCapability(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, c := range s.capabilities {
+		if c == name {
+			return true
+		}
+	}
+	return false
 }
 
 // RestartCount returns the number of times the process has been restarted.

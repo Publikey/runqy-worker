@@ -17,6 +17,9 @@ type StdioTaskRequest struct {
 	RetryCount int             `json:"retry_count"`
 	MaxRetry   int             `json:"max_retry"`
 	Queue      string          `json:"queue"`
+	// Control, when set, asks the process to run a control action (e.g. "reload")
+	// instead of a task. Only sent to processes that announced the capability.
+	Control string `json:"control,omitempty"`
 }
 
 // StdioTaskResponse is the JSON response received from the child process via stdout.
@@ -181,6 +184,63 @@ func (h *StdioHandler) ProcessTask(ctx context.Context, task Task) error {
 	case <-ctx.Done():
 		return ctx.Err()
 
+	case <-doneCh:
+		return fmt.Errorf("handler stopped while waiting for response")
+	}
+}
+
+// Control asks the child process to run a control action (e.g. "reload") and waits
+// for its answer. The request rides the task protocol under a synthetic task id, so it
+// is processed in order with the tasks already sent.
+func (h *StdioHandler) Control(ctx context.Context, id, action string) error {
+	h.mu.RLock()
+	if h.closed {
+		h.mu.RUnlock()
+		return fmt.Errorf("stdio handler is closed")
+	}
+	doneCh := h.done
+	h.mu.RUnlock()
+
+	responseCh := make(chan *StdioTaskResponse, 1)
+	h.mu.Lock()
+	h.pending[id] = responseCh
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		delete(h.pending, id)
+		h.mu.Unlock()
+	}()
+
+	reqBytes, err := json.Marshal(StdioTaskRequest{TaskID: id, Type: "runqy.control", Control: action})
+	if err != nil {
+		return err
+	}
+	var writeErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				writeErr = fmt.Errorf("panic writing to stdin: %v", r)
+			}
+		}()
+		h.stdinMu.Lock()
+		_, writeErr = h.stdin.Write(append(reqBytes, '\n'))
+		h.stdinMu.Unlock()
+	}()
+	if writeErr != nil {
+		return fmt.Errorf("failed to write to stdin: %w", writeErr)
+	}
+
+	select {
+	case resp, ok := <-responseCh:
+		if !ok {
+			return fmt.Errorf("handler closed while waiting for response")
+		}
+		if resp.Error != "" {
+			return fmt.Errorf("%s", resp.Error)
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-doneCh:
 		return fmt.Errorf("handler stopped while waiting for response")
 	}
