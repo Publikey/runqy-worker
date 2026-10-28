@@ -20,6 +20,7 @@ import (
 type QueueState struct {
 	Name           string
 	Priority       int
+	StrictPriority bool                      // Sub-queues polled in strict priority order (else weighted)
 	SubQueues      []BootstrapSubQueueConfig // Sub-queues for this parent queue
 	Response       *BootstrapResponse
 	Deployment     *DeploymentResult
@@ -247,9 +248,13 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 
 	// Build aggregated queue weights map from all SUB-queues
 	w.config.Queues = make(map[string]int)
+	w.config.StrictPriority = make(map[string]bool)
 	for _, state := range w.queueStates {
 		for _, sq := range state.SubQueues {
 			w.config.Queues[sq.Name] = sq.Priority
+		}
+		if state.StrictPriority {
+			w.config.StrictPriority[state.Name] = true
 		}
 	}
 
@@ -401,13 +406,14 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 	}
 
 	state := &QueueState{
-		Name:         parentQueue,
-		Priority:     resp.Queue.Priority,
-		SubQueues:    subQueuesToListen, // Only the sub-queues we're actually listening on
-		Response:     resp,
-		Deployment:   deployment,
-		Mode:         resp.Deployment.Mode,
-		RedisStorage: resp.Deployment.RedisStorage,
+		Name:           parentQueue,
+		Priority:       resp.Queue.Priority,
+		StrictPriority: resp.Queue.StrictPriority,
+		SubQueues:      subQueuesToListen, // Only the sub-queues we're actually listening on
+		Response:       resp,
+		Deployment:     deployment,
+		Mode:           resp.Deployment.Mode,
+		RedisStorage:   resp.Deployment.RedisStorage,
 	}
 	if state.Mode == "" {
 		state.Mode = "long_running"
@@ -477,7 +483,11 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 		}
 	}
 
-	w.logger.Info("[%s] Bootstrap complete with %d sub-queues (priority=%d)", parentQueue, len(subQueuesToListen), state.Priority)
+	order := "weighted"
+	if state.StrictPriority {
+		order = "strict"
+	}
+	w.logger.Info("[%s] Bootstrap complete with %d sub-queues (priority=%d, order=%s)", parentQueue, len(subQueuesToListen), state.Priority, order)
 	return state, nil
 }
 

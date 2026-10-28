@@ -142,6 +142,7 @@ func newTestProcessor(cfg Config) *processor {
 		queueHandlers: make(map[string]HandlerFunc),
 		config:        cfg,
 		queues:        []string{"test.default"},
+		order:         newQueueOrder(map[string]int{"test.default": 1}, nil),
 		done:          make(chan struct{}),
 		stopping:      make(chan struct{}),
 		logger:        cfg.Logger,

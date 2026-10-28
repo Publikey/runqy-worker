@@ -83,7 +83,7 @@ func (lr *leaseRecoverer) recover() {
 	// 30-second buffer to accommodate clock skew (same as asynq's recoverer)
 	cutoff := time.Now().Add(-30 * time.Second)
 
-	// Deduplicate queues (buildQueueList may repeat queues for weighting)
+	// Deduplicate queues (defensive: callers may pass repeated names)
 	seen := make(map[string]bool, len(lr.queues))
 	for _, q := range lr.queues {
 		if seen[q] {

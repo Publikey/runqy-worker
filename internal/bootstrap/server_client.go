@@ -59,8 +59,9 @@ type RedisConfig struct {
 
 // QueueConfig holds queue configuration from server.
 type QueueConfig struct {
-	Name     string `json:"name"`
-	Priority int    `json:"priority"` // Weight for this queue
+	Name           string `json:"name"`
+	Priority       int    `json:"priority"`                  // Weight for this queue
+	StrictPriority bool   `json:"strict_priority,omitempty"` // Poll sub-queues in strict priority order
 }
 
 // SubQueueConfig represents a sub-queue with its full name and priority.

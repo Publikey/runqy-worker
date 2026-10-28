@@ -284,7 +284,7 @@ func appendVarint(buf []byte, val uint64) []byte {
 }
 
 // unpausedQueues returns the queues that are not paused, keeping their order (which
-// carries the priority weighting). One pipelined EXISTS per queue.
+// carries the priority: BRPOP serves the first non-empty key). One pipelined EXISTS per queue.
 func (r *Client) unpausedQueues(ctx context.Context, queues []string) ([]string, error) {
 	pipe := r.Rdb.Pipeline()
 	cmds := make([]*redis.IntCmd, len(queues))
@@ -600,7 +600,7 @@ func (r *Client) ForwardReady(ctx context.Context, queues []string) (int, error)
 	now := float64(time.Now().Unix())
 	total := 0
 
-	// Deduplicate queue names (buildQueueList may repeat queues for weighting)
+	// Deduplicate queue names (callers may pass repeated names)
 	seen := make(map[string]bool, len(queues))
 	for _, q := range queues {
 		if seen[q] {

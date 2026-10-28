@@ -16,7 +16,8 @@ type processor struct {
 	handler          Handler                // fallback handler (ServeMux for type-based routing)
 	queueHandlers    map[string]HandlerFunc // queue name -> handler (for queue-based routing)
 	config           Config
-	queues           []string               // Queue names in priority order
+	queues           []string               // Unique queue names (maintenance loops)
+	order            *queueOrder            // Per-dequeue polling order (weights / strict priority)
 	queueStates      map[string]*QueueState // supervised processes per queue (may be nil)
 	subQueueToState  map[string]*QueueState // sub-queue name -> parent queue state
 	reconnector      *redisReconnector      // for connection recovery
@@ -41,15 +42,15 @@ type processor struct {
 
 // newProcessor creates a new processor.
 func newProcessor(rdb *redisClient, handler Handler, cfg Config) *processor {
-	// Build queue list based on weights (higher weight = appears more in list)
-	queues := buildQueueList(cfg.Queues)
+	order := newQueueOrder(cfg.Queues, cfg.StrictPriority)
 
 	return &processor{
 		redis:         rdb,
 		handler:       handler,
 		queueHandlers: make(map[string]HandlerFunc),
 		config:        cfg,
-		queues:        queues,
+		queues:        order.names,
+		order:         order,
 		done:          make(chan struct{}),
 		stopping:      make(chan struct{}),
 		logger:        cfg.Logger,
@@ -120,17 +121,6 @@ func (p *processor) updateClient(client *redis.Client, logger Logger) {
 	p.redisMu.Lock()
 	defer p.redisMu.Unlock()
 	p.redis = newRedisClient(client, logger)
-}
-
-// buildQueueList creates a weighted list of queues for round-robin selection.
-func buildQueueList(queueWeights map[string]int) []string {
-	var result []string
-	for queue, weight := range queueWeights {
-		for i := 0; i < weight; i++ {
-			result = append(result, queue)
-		}
-	}
-	return result
 }
 
 // Note: parentQueueName is defined in worker.go and shared by both files.
@@ -256,7 +246,7 @@ func (p *processor) processOne(ctx context.Context) {
 	p.redisMu.RUnlock()
 
 	// Dequeue a task
-	task, err := redisClient.dequeue(ctx, p.queues, p.config.LeaseDuration)
+	task, err := redisClient.dequeue(ctx, p.order.next(), p.config.LeaseDuration)
 	if err != nil {
 		p.logger.Error("Dequeue error: %v", err)
 
