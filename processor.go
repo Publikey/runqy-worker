@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -38,6 +39,11 @@ type processor struct {
 	// Lease extender lifecycle.
 	leaseDone chan struct{}
 	leaseWg   sync.WaitGroup
+
+	// Parent queues held by a control command (drain, code update): no new task is
+	// dequeued from their sub-queues while in-flight ones finish.
+	held   map[string]bool
+	heldMu sync.RWMutex
 }
 
 // newProcessor creates a new processor.
@@ -92,6 +98,78 @@ func (p *processor) activity() (active int, lastTaskAt time.Time) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
 	return len(p.inflight), p.lastTaskAt
+}
+
+// hold stops dequeuing from the sub-queues of the given parent queues.
+func (p *processor) hold(parents ...string) {
+	p.heldMu.Lock()
+	defer p.heldMu.Unlock()
+	if p.held == nil {
+		p.held = make(map[string]bool)
+	}
+	for _, parent := range parents {
+		p.held[parent] = true
+	}
+}
+
+// release resumes dequeuing from the given parent queues.
+func (p *processor) release(parents ...string) {
+	p.heldMu.Lock()
+	defer p.heldMu.Unlock()
+	for _, parent := range parents {
+		delete(p.held, parent)
+	}
+}
+
+// heldParents lists the parent queues currently held.
+func (p *processor) heldParents() []string {
+	p.heldMu.RLock()
+	defer p.heldMu.RUnlock()
+	out := make([]string, 0, len(p.held))
+	for parent := range p.held {
+		out = append(out, parent)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// dequeueQueues is the polling order for the next dequeue (weights / strict priority, see
+// queueOrder) without the held parents' sub-queues.
+func (p *processor) dequeueQueues() []string {
+	order := p.order.next()
+	p.heldMu.RLock()
+	defer p.heldMu.RUnlock()
+	if len(p.held) == 0 {
+		return order
+	}
+	out := make([]string, 0, len(order))
+	for _, q := range order {
+		if !p.held[parentQueueName(q)] {
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+// activeFor counts in-flight tasks belonging to the given parent queues (all when none
+// are given).
+func (p *processor) activeFor(parents ...string) int {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	if len(parents) == 0 {
+		return len(p.inflight)
+	}
+	want := make(map[string]bool, len(parents))
+	for _, parent := range parents {
+		want[parent] = true
+	}
+	n := 0
+	for _, q := range p.inflight {
+		if want[parentQueueName(q)] {
+			n++
+		}
+	}
+	return n
 }
 
 // SetQueueHandler sets the handler for a specific queue.
@@ -245,8 +323,19 @@ func (p *processor) processOne(ctx context.Context) {
 	redisClient := p.redis
 	p.redisMu.RUnlock()
 
+	queues := p.dequeueQueues()
+	if len(queues) == 0 {
+		// Every queue is held (drained): wait instead of dequeuing.
+		select {
+		case <-ctx.Done():
+		case <-p.stopping:
+		case <-time.After(500 * time.Millisecond):
+		}
+		return
+	}
+
 	// Dequeue a task
-	task, err := redisClient.dequeue(ctx, p.order.next(), p.config.LeaseDuration)
+	task, err := redisClient.dequeue(ctx, queues, p.config.LeaseDuration)
 	if err != nil {
 		p.logger.Error("Dequeue error: %v", err)
 

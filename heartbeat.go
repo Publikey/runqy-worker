@@ -31,6 +31,8 @@ type heartbeat struct {
 
 	activityFn func() (active int, lastTaskAt time.Time) // processor activity (nil until processing starts)
 	activityMu sync.RWMutex
+
+	controlFn func(data map[string]interface{}) // control channel state (nil until listening)
 }
 
 // newHeartbeat creates a new heartbeat sender.
@@ -170,12 +172,14 @@ func (h *heartbeat) register(ctx context.Context) {
 		"status":      h.getStatus(),
 		"healthy":     h.isHealthy(),
 		"protected":   fmt.Sprintf("%v", h.config.Protected),
+		"version":     h.config.Version,
 	}
 
 	// Autoscaling correlation: only write instance_id when set to avoid clutter.
 	if h.config.InstanceID != "" {
 		data["instance_id"] = h.config.InstanceID
 	}
+	h.addControl(data)
 
 	// Attach system metrics
 	if m, err := collectMetrics(); err == nil {
@@ -212,6 +216,7 @@ func (h *heartbeat) beat(ctx context.Context) {
 		"queues":      encodeQueues(h.config.Queues),
 		"concurrency": h.config.Concurrency,
 		"protected":   fmt.Sprintf("%v", h.config.Protected),
+		"version":     h.config.Version,
 	}
 
 	// Autoscaling correlation: only write instance_id when set to avoid clutter.
@@ -222,6 +227,7 @@ func (h *heartbeat) beat(ctx context.Context) {
 	// Per-worker activity, so the autoscaler can measure idleness per instance and never
 	// destroy one that is mid-task.
 	h.addActivity(beatData)
+	h.addControl(beatData)
 
 	// Attach system metrics
 	if m, err := collectMetrics(); err == nil {
@@ -350,6 +356,30 @@ func encodeQueues(queues map[string]int) string {
 		return "{}"
 	}
 	return string(b)
+}
+
+// setControlSource wires the control channel's state (supported actions, last command,
+// draining status) into the heartbeat.
+func (h *heartbeat) setControlSource(fn func(data map[string]interface{})) {
+	h.activityMu.Lock()
+	h.controlFn = fn
+	h.activityMu.Unlock()
+}
+
+func (h *heartbeat) addControl(data map[string]interface{}) {
+	h.activityMu.RLock()
+	fn := h.controlFn
+	h.activityMu.RUnlock()
+	if fn != nil {
+		fn(data)
+	}
+}
+
+// client returns the current Redis client (it changes on reconnection).
+func (h *heartbeat) client() *redis.Client {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.rdb
 }
 
 // setActivitySource wires the processor's activity reporter into the heartbeat.

@@ -124,6 +124,12 @@ func (h *StdioHandler) ProcessTask(ctx context.Context, task *Task) error {
 	return h.internal.ProcessTask(ctx, task)
 }
 
+// Control asks the child process to run a control action (e.g. "reload") and waits for
+// its answer. Only send actions the process announced in its ready signal.
+func (h *StdioHandler) Control(ctx context.Context, id, action string) error {
+	return h.internal.Control(ctx, id, action)
+}
+
 // Reconnect swaps the stdin/stdout pipes after a process restart.
 func (h *StdioHandler) Reconnect(stdin io.Writer, stdout io.Reader) {
 	h.internal.Reconnect(stdin, stdout)

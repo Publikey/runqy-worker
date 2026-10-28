@@ -168,3 +168,41 @@ func TestStdioHandler_ReconnectMultipleTimes(t *testing.T) {
 	stdoutW1.Close()
 	h.Stop()
 }
+
+func TestStdioHandler_Control(t *testing.T) {
+	stdin := &bytes.Buffer{}
+	stdoutR, stdoutW := io.Pipe()
+	h := NewStdioHandler(stdin, stdoutR, &testLogger{}, false)
+	h.Start()
+	defer func() {
+		stdoutW.Close()
+		h.Stop()
+	}()
+
+	reply := func(resp StdioTaskResponse) {
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			data, _ := json.Marshal(resp)
+			stdoutW.Write(append(data, '\n'))
+		}()
+	}
+
+	reply(StdioTaskResponse{TaskID: "control-1", Result: json.RawMessage(`{"reloaded":true}`)})
+	if err := h.Control(context.Background(), "control-1", "reload"); err != nil {
+		t.Fatalf("Control: %v", err)
+	}
+	if !strings.Contains(stdin.String(), `"control":"reload"`) || !strings.Contains(stdin.String(), `"task_id":"control-1"`) {
+		t.Errorf("request = %s", stdin.String())
+	}
+
+	reply(StdioTaskResponse{TaskID: "control-2", Error: "models.yml unreachable"})
+	if err := h.Control(context.Background(), "control-2", "reload"); err == nil || !strings.Contains(err.Error(), "unreachable") {
+		t.Errorf("Control error = %v, want the process error", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := h.Control(ctx, "control-3", "reload"); err == nil {
+		t.Error("Control without an answer should time out")
+	}
+}

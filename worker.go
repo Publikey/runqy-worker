@@ -32,6 +32,26 @@ type QueueState struct {
 	RedisStorage   bool             // Whether to store results/completion in Redis
 
 	restarter processRestarter // restarts the long_running process after a task timeout
+
+	// mu guards the handler fields swapped by a code update (OneShotHandler,
+	// Supervisor, Recovery, Response, Deployment).
+	mu sync.RWMutex
+}
+
+// processTask routes a task to the queue's current handler. Handlers are registered
+// through this indirection so a code update can swap them without touching the
+// processor's handler map.
+func (s *QueueState) processTask(ctx context.Context, task *Task) error {
+	s.mu.RLock()
+	oneShot, stdio := s.OneShotHandler, s.StdioHandler
+	s.mu.RUnlock()
+	if oneShot != nil {
+		return oneShot.ProcessTask(ctx, task)
+	}
+	if stdio != nil {
+		return stdio.ProcessTask(ctx, task)
+	}
+	return fmt.Errorf("queue %s has no handler", s.Name)
 }
 
 // Worker processes tasks from Redis queues.
@@ -45,7 +65,13 @@ type Worker struct {
 	leaseRecoverer *leaseRecoverer
 	janitor        *janitor
 	reconnector    *redisReconnector
+	controller     *controller
 	queueHandlers  map[string]HandlerFunc // stored until processor is created
+
+	// reexecPath is set by worker_update: after a graceful shutdown, Run() re-executes
+	// this binary in place instead of returning.
+	reexecPath string
+	reexecMu   sync.Mutex
 
 	// Multi-queue bootstrap state
 	queueStates  map[string]*QueueState
@@ -450,7 +476,7 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 		)
 		// Register handler only for configured sub-queues (they share the same one-shot handler)
 		for _, sq := range subQueuesToListen {
-			w.HandleQueue(sq.Name, state.OneShotHandler.ProcessTask)
+			w.HandleQueue(sq.Name, state.processTask)
 		}
 
 	default: // "long_running"
@@ -705,6 +731,8 @@ func (w *Worker) Run() error {
 	w.forwarder.start()
 	w.leaseRecoverer.start()
 	w.janitor.start()
+	w.controller = newController(w)
+	w.controller.start()
 
 	w.logger.Info("Worker running. Press Ctrl+C to stop.")
 
@@ -719,7 +747,25 @@ func (w *Worker) Run() error {
 		w.logger.Info("Shutdown requested...")
 	}
 
-	return w.shutdown()
+	err := w.shutdown()
+	w.reexecMu.Lock()
+	path := w.reexecPath
+	w.reexecMu.Unlock()
+	if path != "" {
+		w.logger.Info("Re-executing %s...", path)
+		if execErr := reexec(path); execErr != nil {
+			return fmt.Errorf("worker update: re-exec failed: %w", execErr)
+		}
+	}
+	return err
+}
+
+// requestReexec asks Run() to shut down gracefully and re-execute path.
+func (w *Worker) requestReexec(path string) {
+	w.reexecMu.Lock()
+	w.reexecPath = path
+	w.reexecMu.Unlock()
+	w.Shutdown()
 }
 
 // Start starts the worker in the background (non-blocking).
@@ -827,6 +873,11 @@ func (w *Worker) Shutdown() {
 
 // shutdown performs the actual shutdown sequence.
 func (w *Worker) shutdown() error {
+	if w.controller != nil {
+		w.logger.Info("Stopping control channel...")
+		w.controller.cancel() // stop listening; a running command sees the cancellation
+	}
+
 	w.logger.Info("Stopping janitor...")
 	if w.janitor != nil {
 		w.janitor.stop()

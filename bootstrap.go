@@ -67,6 +67,18 @@ func deployCode(ctx context.Context, config Config, spec BootstrapDeploymentConf
 	return internalbootstrap.DeployCode(ctx, bsCfg, spec, &loggerAdapter{logger})
 }
 
+// updateCode moves an existing deployment to the latest commit of its branch and
+// reinstalls dependencies (control command code_update).
+func updateCode(ctx context.Context, config Config, spec BootstrapDeploymentConfig, logger Logger) (*DeploymentResult, error) {
+	bsCfg := internalbootstrap.Config{
+		DeploymentDir:         config.DeploymentDir,
+		GitSSHKey:             config.GitSSHKey,
+		GitToken:              config.GitToken,
+		UseSystemSitePackages: config.UseSystemSitePackages,
+	}
+	return internalbootstrap.UpdateCode(ctx, bsCfg, spec, &loggerAdapter{logger})
+}
+
 // newProcessSupervisor creates a new ProcessSupervisor.
 func newProcessSupervisor(deployment *DeploymentResult, spec BootstrapDeploymentConfig, vaultVars map[string]string, logger Logger) *ProcessSupervisor {
 	return internalbootstrap.NewProcessSupervisor(deployment, spec, vaultVars, &loggerAdapter{logger})

@@ -36,18 +36,24 @@ func (r *processRestarter) restartAfterTimeout(gen uint64, state *QueueState, ta
 	}
 	r.gen++
 
+	// A code update swaps these under state.mu. It cannot run concurrently: it waits for the
+	// queue to be idle, and this task stays in flight until the restart is over.
+	state.mu.RLock()
+	sup, recovery, stdio := state.Supervisor, state.Recovery, state.StdioHandler
+	state.mu.RUnlock()
+
 	logger.Warn("[%s] Task %s timed out — restarting the process to stop it", state.Name, taskID)
 	start := time.Now()
 	var err error
-	if state.Recovery != nil {
-		err = state.Recovery.RestartNow()
+	if recovery != nil {
+		err = recovery.RestartNow()
 	} else {
-		timeout := time.Duration(state.Supervisor.TimeoutSec())*time.Second + 30*time.Second
+		timeout := time.Duration(sup.TimeoutSec())*time.Second + 30*time.Second
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		err = state.Supervisor.Restart(ctx)
+		err = sup.Restart(ctx)
 		cancel()
 		if err == nil {
-			state.StdioHandler.Reconnect(state.Supervisor.Stdin(), state.Supervisor.Stdout())
+			stdio.Reconnect(sup.Stdin(), sup.Stdout())
 		}
 	}
 	if err != nil {
@@ -62,7 +68,7 @@ func (r *processRestarter) restartAfterTimeout(gen uint64, state *QueueState, ta
 func longRunningHandler(state *QueueState, logger Logger) HandlerFunc {
 	return func(ctx context.Context, task *Task) error {
 		gen := state.restarter.generation()
-		err := state.StdioHandler.ProcessTask(ctx, task)
+		err := state.processTask(ctx, task)
 		// DeadlineExceeded is the task's own active timeout; a worker shutdown cancels instead.
 		if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			state.restarter.restartAfterTimeout(gen, state, task.ID(), logger)
