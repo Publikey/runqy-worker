@@ -20,8 +20,8 @@ import (
 
 func TestProcessorHold(t *testing.T) {
 	p := newProcessor(nil, NewServeMux(), Config{Queues: map[string]int{"a.high": 2, "a.low": 1, "b.default": 1}, Logger: NewStdLogger()})
-	if got := len(p.dequeueQueues()); got != 4 {
-		t.Fatalf("weighted queues = %d, want 4", got)
+	if got := len(p.dequeueQueues()); got != 3 {
+		t.Fatalf("dequeue queues = %d, want 3 (each queue once)", got)
 	}
 	p.hold("a")
 	for _, q := range p.dequeueQueues() {
@@ -35,7 +35,7 @@ func TestProcessorHold(t *testing.T) {
 		t.Errorf("activeFor a=%d b=%d all=%d", p.activeFor("a"), p.activeFor("b"), p.activeFor())
 	}
 	p.release("a")
-	if got := len(p.dequeueQueues()); got != 4 || len(p.heldParents()) != 0 {
+	if got := len(p.dequeueQueues()); got != 3 || len(p.heldParents()) != 0 {
 		t.Errorf("after release: %d queues, held %v", got, p.heldParents())
 	}
 }
