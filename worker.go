@@ -352,17 +352,6 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 	// Use PARENT queue for deployment directory (ensures deduplication across sub-queues)
 	queueConfig.DeploymentDir = filepath.Join(w.config.DeploymentDir, parentQueue)
 
-	// Deploy code for this parent queue (once, shared by all sub-queues)
-	// Pass git token from server response (resolved from vault) for authentication
-	if resp.GitToken != "" {
-		queueConfig.GitToken = resp.GitToken
-	}
-	w.logger.Info("[%s] Deploying code from %s (branch: %s)...", parentQueue, resp.Deployment.GitURL, resp.Deployment.Branch)
-	deployment, err := deployCode(ctx, queueConfig, resp.Deployment, w.logger)
-	if err != nil {
-		return nil, fmt.Errorf("code deployment failed: %w", err)
-	}
-
 	// Determine sub-queues from response
 	allSubQueues := resp.SubQueues
 	if len(allSubQueues) == 0 {
@@ -405,6 +394,25 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 				w.logger.Warn("[%s] Configured sub-queue %q not found in server response", parentQueue, configured)
 			}
 		}
+	}
+	if len(subQueuesToListen) == 0 {
+		// Nothing to listen on: fail instead of running a worker that never takes a task.
+		known := make([]string, 0, len(allSubQueues))
+		for _, sq := range allSubQueues {
+			known = append(known, sq.Name)
+		}
+		return nil, fmt.Errorf("none of the configured sub-queues %v exist on the server (known: %v)", group.configuredSQs, known)
+	}
+
+	// Deploy code for this parent queue (once, shared by all sub-queues)
+	// Pass git token from server response (resolved from vault) for authentication
+	if resp.GitToken != "" {
+		queueConfig.GitToken = resp.GitToken
+	}
+	w.logger.Info("[%s] Deploying code from %s (branch: %s)...", parentQueue, resp.Deployment.GitURL, resp.Deployment.Branch)
+	deployment, err := deployCode(ctx, queueConfig, resp.Deployment, w.logger)
+	if err != nil {
+		return nil, fmt.Errorf("code deployment failed: %w", err)
 	}
 
 	state := &QueueState{
