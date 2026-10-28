@@ -20,6 +20,7 @@ import (
 type QueueState struct {
 	Name           string
 	Priority       int
+	StrictPriority bool                      // Sub-queues polled in strict priority order (else weighted)
 	SubQueues      []BootstrapSubQueueConfig // Sub-queues for this parent queue
 	Response       *BootstrapResponse
 	Deployment     *DeploymentResult
@@ -29,6 +30,8 @@ type QueueState struct {
 	Recovery       *processRecovery // Auto-recovery watcher (nil for one_shot mode)
 	Mode           string           // "long_running" or "one_shot"
 	RedisStorage   bool             // Whether to store results/completion in Redis
+
+	restarter processRestarter // restarts the long_running process after a task timeout
 }
 
 // Worker processes tasks from Redis queues.
@@ -247,9 +250,13 @@ func (w *Worker) Bootstrap(ctx context.Context) error {
 
 	// Build aggregated queue weights map from all SUB-queues
 	w.config.Queues = make(map[string]int)
+	w.config.StrictPriority = make(map[string]bool)
 	for _, state := range w.queueStates {
 		for _, sq := range state.SubQueues {
 			w.config.Queues[sq.Name] = sq.Priority
+		}
+		if state.StrictPriority {
+			w.config.StrictPriority[state.Name] = true
 		}
 	}
 
@@ -345,17 +352,6 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 	// Use PARENT queue for deployment directory (ensures deduplication across sub-queues)
 	queueConfig.DeploymentDir = filepath.Join(w.config.DeploymentDir, parentQueue)
 
-	// Deploy code for this parent queue (once, shared by all sub-queues)
-	// Pass git token from server response (resolved from vault) for authentication
-	if resp.GitToken != "" {
-		queueConfig.GitToken = resp.GitToken
-	}
-	w.logger.Info("[%s] Deploying code from %s (branch: %s)...", parentQueue, resp.Deployment.GitURL, resp.Deployment.Branch)
-	deployment, err := deployCode(ctx, queueConfig, resp.Deployment, w.logger)
-	if err != nil {
-		return nil, fmt.Errorf("code deployment failed: %w", err)
-	}
-
 	// Determine sub-queues from response
 	allSubQueues := resp.SubQueues
 	if len(allSubQueues) == 0 {
@@ -399,15 +395,35 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 			}
 		}
 	}
+	if len(subQueuesToListen) == 0 {
+		// Nothing to listen on: fail instead of running a worker that never takes a task.
+		known := make([]string, 0, len(allSubQueues))
+		for _, sq := range allSubQueues {
+			known = append(known, sq.Name)
+		}
+		return nil, fmt.Errorf("none of the configured sub-queues %v exist on the server (known: %v)", group.configuredSQs, known)
+	}
+
+	// Deploy code for this parent queue (once, shared by all sub-queues)
+	// Pass git token from server response (resolved from vault) for authentication
+	if resp.GitToken != "" {
+		queueConfig.GitToken = resp.GitToken
+	}
+	w.logger.Info("[%s] Deploying code from %s (branch: %s)...", parentQueue, resp.Deployment.GitURL, resp.Deployment.Branch)
+	deployment, err := deployCode(ctx, queueConfig, resp.Deployment, w.logger)
+	if err != nil {
+		return nil, fmt.Errorf("code deployment failed: %w", err)
+	}
 
 	state := &QueueState{
-		Name:         parentQueue,
-		Priority:     resp.Queue.Priority,
-		SubQueues:    subQueuesToListen, // Only the sub-queues we're actually listening on
-		Response:     resp,
-		Deployment:   deployment,
-		Mode:         resp.Deployment.Mode,
-		RedisStorage: resp.Deployment.RedisStorage,
+		Name:           parentQueue,
+		Priority:       resp.Queue.Priority,
+		StrictPriority: resp.Queue.StrictPriority,
+		SubQueues:      subQueuesToListen, // Only the sub-queues we're actually listening on
+		Response:       resp,
+		Deployment:     deployment,
+		Mode:           resp.Deployment.Mode,
+		RedisStorage:   resp.Deployment.RedisStorage,
 	}
 	if state.Mode == "" {
 		state.Mode = "long_running"
@@ -473,11 +489,15 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 
 		// Register handler only for configured sub-queues (they share the same stdio handler)
 		for _, sq := range subQueuesToListen {
-			w.HandleQueue(sq.Name, state.StdioHandler.ProcessTask)
+			w.HandleQueue(sq.Name, longRunningHandler(state, w.logger))
 		}
 	}
 
-	w.logger.Info("[%s] Bootstrap complete with %d sub-queues (priority=%d)", parentQueue, len(subQueuesToListen), state.Priority)
+	order := "weighted"
+	if state.StrictPriority {
+		order = "strict"
+	}
+	w.logger.Info("[%s] Bootstrap complete with %d sub-queues (priority=%d, order=%s)", parentQueue, len(subQueuesToListen), state.Priority, order)
 	return state, nil
 }
 

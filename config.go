@@ -35,6 +35,9 @@ type Config struct {
 	// Worker settings
 	Concurrency int            // Max parallel tasks (default: 1)
 	Queues      map[string]int // Queue name -> priority weight (populated by bootstrap)
+	// StrictPriority lists the parent queues whose sub-queues are polled in strict
+	// descending priority instead of the default weighted draw (populated by bootstrap).
+	StrictPriority map[string]bool
 
 	// Autoscaling correlation (optional)
 	InstanceID string // Optional: opaque id the autoscaler assigns to the cloud instance. Default empty.

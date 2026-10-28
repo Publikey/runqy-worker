@@ -284,7 +284,7 @@ func appendVarint(buf []byte, val uint64) []byte {
 }
 
 // unpausedQueues returns the queues that are not paused, keeping their order (which
-// carries the priority weighting). One pipelined EXISTS per queue.
+// carries the priority: BRPOP serves the first non-empty key). One pipelined EXISTS per queue.
 func (r *Client) unpausedQueues(ctx context.Context, queues []string) ([]string, error) {
 	pipe := r.Rdb.Pipeline()
 	cmds := make([]*redis.IntCmd, len(queues))
@@ -428,7 +428,8 @@ func (r *Client) Dequeue(ctx context.Context, queues []string, leaseDuration tim
 	// lifecycle values stamped by the server (absent fields → -1, caller falls back to config).
 	var pendingSince int64
 	if v, ok := data[FieldPendingSince]; ok {
-		pendingSince, _ = strconv.ParseInt(v, 10, 64)
+		raw, _ := strconv.ParseInt(v, 10, 64)
+		pendingSince = UnixSeconds(raw)
 	}
 
 	taskData := &TaskData{
@@ -600,7 +601,7 @@ func (r *Client) ForwardReady(ctx context.Context, queues []string) (int, error)
 	now := float64(time.Now().Unix())
 	total := 0
 
-	// Deduplicate queue names (buildQueueList may repeat queues for weighting)
+	// Deduplicate queue names (callers may pass repeated names)
 	seen := make(map[string]bool, len(queues))
 	for _, q := range queues {
 		if seen[q] {
@@ -636,7 +637,7 @@ func (r *Client) ForwardReady(ctx context.Context, queues []string) (int, error)
 			`)
 			result, err := forwardScript.Run(ctx, r.Rdb,
 				[]string{retryKey, pendingKey, taskKey},
-				taskID, StatePending, time.Now().Unix(),
+				taskID, StatePending, time.Now().UnixNano(), // nanoseconds, like asynq's enqueue
 			).Int()
 			if err != nil {
 				r.Logger.Error("ForwardReady: failed to forward task %s: %v", taskID, err)
@@ -650,6 +651,19 @@ func (r *Client) ForwardReady(ctx context.Context, queues []string) (int, error)
 	}
 
 	return total, nil
+}
+
+// UnixSeconds converts a stored timestamp to unix seconds. asynq (the server's enqueue)
+// writes pending_since in nanoseconds; workers before v0.3.2 wrote seconds on retry.
+func UnixSeconds(v int64) int64 {
+	switch {
+	case v > 1e15: // nanoseconds
+		return v / 1e9
+	case v > 1e12: // milliseconds
+		return v / 1e3
+	default:
+		return v
+	}
 }
 
 // failCmd atomically removes from active/lease and archives a task.
