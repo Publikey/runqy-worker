@@ -177,3 +177,27 @@ func TestDownloadRelease(t *testing.T) {
 		t.Error("missing release accepted")
 	}
 }
+
+// worker_update hands its outcome to the re-executed binary, which publishes it instead of
+// leaving the heartbeat on "running".
+func TestControlHandoffAfterWorkerUpdate(t *testing.T) {
+	t.Setenv(controlHandoffEnv, `{"id":"x1","action":"worker_update","state":"done","message":"updated from 0.4.0 to 0.4.1","at":1}`)
+	w := newControlTestWorker()
+	data := heartbeatFields(w)
+	if s, _ := data["control"].(string); !strings.Contains(s, `"state":"done"`) || !strings.Contains(s, "0.4.1") {
+		t.Fatalf("control field = %v", data["control"])
+	}
+	if os.Getenv(controlHandoffEnv) != "" {
+		t.Fatal("handoff env not cleared")
+	}
+}
+
+func TestLastLineOfTraceback(t *testing.T) {
+	tb := "Traceback (most recent call last):\n  File \"main.py\", line 3, in refresh\njson.decoder.JSONDecodeError: Expecting value: line 1 column 11 (char 10)\n"
+	if got := lastLine(tb); got != "json.decoder.JSONDecodeError: Expecting value: line 1 column 11 (char 10)" {
+		t.Fatalf("lastLine = %q", got)
+	}
+	if got := lastLine("busy"); got != "busy" {
+		t.Fatalf("lastLine = %q", got)
+	}
+}

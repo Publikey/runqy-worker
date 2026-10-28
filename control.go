@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -75,7 +76,35 @@ type controller struct {
 
 func newController(w *Worker) *controller {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &controller{w: w, logger: w.logger, ctx: ctx, cancel: cancel}
+	c := &controller{w: w, logger: w.logger, ctx: ctx, cancel: cancel}
+	c.last = takeControlHandoff()
+	return c
+}
+
+// controlHandoffEnv carries the outcome of a worker_update to the re-executed binary: the
+// old process exits before a heartbeat can publish it, and the heartbeat would otherwise
+// keep showing the command as running.
+const controlHandoffEnv = "RUNQY_CONTROL_HANDOFF"
+
+// lastLine keeps the last non-empty line of a message: for a Python traceback, the
+// exception itself (the full traceback goes to the worker log).
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
+}
+
+// takeControlHandoff returns the command outcome left by the previous binary, if any.
+func takeControlHandoff() *controlResult {
+	v := os.Getenv(controlHandoffEnv)
+	if v == "" {
+		return nil
+	}
+	os.Unsetenv(controlHandoffEnv)
+	var r controlResult
+	if json.Unmarshal([]byte(v), &r) != nil || r.Action == "" {
+		return nil
+	}
+	return &r
 }
 
 // start subscribes to the control channels and publishes the control state in the
@@ -257,6 +286,9 @@ func (c *controller) addHeartbeatFields(data map[string]interface{}) {
 	c.mu.Lock()
 	last, draining := c.last, c.draining
 	c.mu.Unlock()
+	// Always written: a previous process with the same worker id (container restarted within
+	// the heartbeat TTL) may have left its own last command in the hash.
+	data["control"] = ""
 	if last != nil {
 		if b, err := json.Marshal(last); err == nil {
 			data["control"] = string(b)
@@ -452,7 +484,8 @@ func (c *controller) configReload(msg ControlMessage) (string, error) {
 		err := stdio.Control(ctx, "control-"+msg.ID, "reload")
 		cancel()
 		if err != nil {
-			return "", fmt.Errorf("%s: reload failed: %w", parent, err)
+			c.logger.Error("[%s] Reload failed: %v", parent, err)
+			return "", fmt.Errorf("%s: reload failed: %s", parent, lastLine(err.Error()))
 		}
 		done = append(done, parent)
 	}

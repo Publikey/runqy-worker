@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -79,6 +80,10 @@ func (c *controller) workerUpdate(msg ControlMessage) (string, error) {
 		return "", fmt.Errorf("cannot replace %s: %w", exe, err)
 	}
 	c.logger.Info("Worker binary replaced by %s, restarting...", version)
+	if b, err := json.Marshal(controlResult{ID: msg.ID, Action: msg.Action, State: "done",
+		Message: fmt.Sprintf("updated from %s to %s", c.w.config.Version, version), At: time.Now().Unix()}); err == nil {
+		os.Setenv(controlHandoffEnv, string(b))
+	}
 	c.w.requestReexec(exe)
 	return "restarting into " + version, nil
 }
