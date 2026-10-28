@@ -30,6 +30,8 @@ type QueueState struct {
 	Recovery       *processRecovery // Auto-recovery watcher (nil for one_shot mode)
 	Mode           string           // "long_running" or "one_shot"
 	RedisStorage   bool             // Whether to store results/completion in Redis
+
+	restarter processRestarter // restarts the long_running process after a task timeout
 }
 
 // Worker processes tasks from Redis queues.
@@ -479,7 +481,7 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 
 		// Register handler only for configured sub-queues (they share the same stdio handler)
 		for _, sq := range subQueuesToListen {
-			w.HandleQueue(sq.Name, state.StdioHandler.ProcessTask)
+			w.HandleQueue(sq.Name, longRunningHandler(state, w.logger))
 		}
 	}
 

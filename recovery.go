@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -52,6 +53,7 @@ type processRecovery struct {
 	currentDelay     time.Duration // current backoff delay, reset by cooldown
 
 	onRestart func(sup *ProcessSupervisor) // callback after successful restart
+	restartCh chan chan error              // planned restarts (e.g. after a task timeout)
 	done      chan struct{}
 	wg        sync.WaitGroup
 }
@@ -64,7 +66,26 @@ func newProcessRecovery(queueName string, supervisor *ProcessSupervisor, config 
 		config:     config,
 		logger:     logger,
 		state:      recoveryIdle,
+		restartCh:  make(chan chan error),
 		done:       make(chan struct{}),
+	}
+}
+
+// RestartNow asks the watch loop to restart the process right away and waits for the
+// outcome. Unlike a crash it does not count toward the circuit breaker (unless the
+// restart itself fails). Running it in the watch loop avoids racing with crash recovery.
+func (r *processRecovery) RestartNow() error {
+	result := make(chan error, 1)
+	select {
+	case r.restartCh <- result:
+	case <-r.done:
+		return fmt.Errorf("recovery stopped")
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-r.done:
+		return fmt.Errorf("recovery stopped")
 	}
 }
 
@@ -123,6 +144,25 @@ func (r *processRecovery) watchLoop() {
 	for {
 		select {
 		case <-r.done:
+			return
+		case result := <-r.restartCh:
+			if r.State() != recoveryIdle {
+				result <- fmt.Errorf("process is %s", r.State())
+				continue
+			}
+			r.mu.Lock()
+			r.state = recoveryRecovering
+			r.mu.Unlock()
+			if r.attemptRestart(0) {
+				result <- nil
+				continue
+			}
+			if r.State() == recoveryDegraded {
+				r.logger.Error("[%s] Planned restart failed — entering degraded state (manual restart required)", r.queueName)
+				result <- fmt.Errorf("restart failed, process degraded")
+			} else {
+				result <- fmt.Errorf("restart interrupted")
+			}
 			return
 		case <-r.supervisor.Done():
 			// Process crashed
