@@ -179,14 +179,14 @@ type loggerAdapter struct {
 }
 
 func (a *loggerAdapter) Info(format string, args ...interface{}) {
-	a.l.Info(fmt.Sprintf(format, args...))
+	a.l.Info(format, args...)
 }
 func (a *loggerAdapter) Warn(format string, args ...interface{}) {
-	a.l.Warn(fmt.Sprintf(format, args...))
+	a.l.Warn(format, args...)
 }
 func (a *loggerAdapter) Error(format string, args ...interface{}) {
-	a.l.Error(fmt.Sprintf(format, args...))
+	a.l.Error(format, args...)
 }
 func (a *loggerAdapter) Debug(format string, args ...interface{}) {
-	a.l.Debug(fmt.Sprintf(format, args...))
+	a.l.Debug(format, args...)
 }
