@@ -9,7 +9,7 @@
   <br>
   Part of the <a href="https://github.com/publikey/runqy">runqy</a> distributed task queue system.
   <br>
-  <a href="https://docs.runqy.com/worker/"><strong>Documentation</strong></a> · <a href="https://runqy.com"><strong>Website</strong></a>
+  <a href="https://runqy.com/docs/worker/"><strong>Documentation</strong></a> · <a href="https://runqy.com"><strong>Website</strong></a>
 </p>
 
 ## Features
@@ -50,7 +50,7 @@ curl -LO https://github.com/publikey/runqy-worker/releases/latest/download/runqy
 tar -xzf runqy-worker_latest_linux_amd64.tar.gz
 ```
 
-See [Installation Guide](https://docs.runqy.com/worker/installation/) for all platforms and options.
+See [Installation Guide](https://runqy.com/docs/getting-started/installation/) for all platforms and options.
 
 ## Quick Start
 
@@ -73,13 +73,13 @@ worker:
 
 The worker connects to the server, pulls your code from Git, installs dependencies, and starts processing tasks.
 
-See [Configuration Reference](https://docs.runqy.com/worker/configuration/) for all options.
+See [Configuration Reference](https://runqy.com/docs/worker/configuration/) for all options.
 
 ## See Also
 
 - [runqy](https://github.com/Publikey/runqy) — Central server with CLI and monitoring dashboard
 - [runqy-python](https://github.com/Publikey/runqy-python) — Python SDK (`runqy-task`)
-- [Documentation](https://docs.runqy.com) — Full documentation
+- [Documentation](https://runqy.com/docs/) — Full documentation
 
 ## License
 
