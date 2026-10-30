@@ -30,6 +30,7 @@ type RecoveryYAMLConfig struct {
 	MaxDelay       string  `yaml:"max_delay"`
 	BackoffFactor  float64 `yaml:"backoff_factor"`
 	CooldownPeriod string  `yaml:"cooldown_period"`
+	DegradedRetry  string  `yaml:"degraded_retry"`
 }
 
 // ServerConfig holds runqy-server connection settings.
@@ -307,6 +308,11 @@ func loadConfigFromEnv() (Config, error) {
 			cfg.Recovery.MaxDelay = d
 		}
 	}
+	if retry := os.Getenv("RUNQY_RECOVERY_DEGRADED_RETRY"); retry != "" {
+		if d, err := time.ParseDuration(retry); err == nil && d >= 0 {
+			cfg.Recovery.DegradedRetry = d
+		}
+	}
 	if cooldown := os.Getenv("RUNQY_RECOVERY_COOLDOWN"); cooldown != "" {
 		if d, err := time.ParseDuration(cooldown); err == nil {
 			cfg.Recovery.CooldownPeriod = d
@@ -447,6 +453,11 @@ func toWorkerConfig(yc *YAMLConfig) (Config, error) {
 	}
 	if yc.Recovery.BackoffFactor > 0 {
 		cfg.Recovery.BackoffFactor = yc.Recovery.BackoffFactor
+	}
+	if yc.Recovery.DegradedRetry != "" {
+		if d, err := time.ParseDuration(yc.Recovery.DegradedRetry); err == nil && d >= 0 {
+			cfg.Recovery.DegradedRetry = d
+		}
 	}
 	if yc.Recovery.CooldownPeriod != "" {
 		if d, err := time.ParseDuration(yc.Recovery.CooldownPeriod); err == nil {

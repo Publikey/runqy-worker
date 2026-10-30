@@ -447,12 +447,7 @@ func (c *controller) updateQueue(state *QueueState) (string, error) {
 	}
 	state.StdioHandler.Reconnect(sup.Stdin(), sup.Stdout())
 	if c.w.config.Recovery.Enabled {
-		recovery := newProcessRecovery(state.Name, sup, c.w.config.Recovery, c.logger)
-		recovery.SetOnRestart(func(s *ProcessSupervisor) {
-			state.StdioHandler.Reconnect(s.Stdin(), s.Stdout())
-		})
-		recovery.Start()
-		state.Recovery = recovery
+		state.Recovery = c.w.startRecovery(state, sup)
 	}
 	return resp.Deployment.Branch + " (process restarted)", nil
 }

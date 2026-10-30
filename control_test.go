@@ -201,3 +201,20 @@ func TestLastLineOfTraceback(t *testing.T) {
 		t.Fatalf("lastLine = %q", got)
 	}
 }
+
+func TestProcessorSkipsQueueWhoseProcessIsDown(t *testing.T) {
+	p := newProcessor(nil, NewServeMux(), Config{Queues: map[string]int{"a.high": 2, "a.low": 1, "b.default": 1}, Logger: NewStdLogger()})
+	down := newProcessSupervisor(&DeploymentResult{}, BootstrapDeploymentConfig{}, nil, NewStdLogger()) // never started: unhealthy
+	// b has no supervisor (one_shot mode): always ready.
+	p.SetQueueStates(map[string]*QueueState{"a": {Name: "a", Supervisor: down}, "b": {Name: "b"}})
+	for i := 0; i < 20; i++ { // the order is redrawn at every call
+		got := p.dequeueQueues()
+		if len(got) != 1 || got[0] != "b.default" {
+			t.Fatalf("dequeue queues = %v, want only b.default while a's process is down", got)
+		}
+	}
+	p.hold("b")
+	if got := p.dequeueQueues(); len(got) != 0 {
+		t.Errorf("dequeue queues = %v, want none (a down, b held)", got)
+	}
+}

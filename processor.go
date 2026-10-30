@@ -44,6 +44,11 @@ type processor struct {
 	// dequeued from their sub-queues while in-flight ones finish.
 	held   map[string]bool
 	heldMu sync.RWMutex
+
+	// Parent queues skipped because their process is down (crashed, restarting or
+	// degraded), so their state changes are logged once.
+	unhealthy   map[string]bool
+	unhealthyMu sync.Mutex
 }
 
 // newProcessor creates a new processor.
@@ -134,21 +139,52 @@ func (p *processor) heldParents() []string {
 }
 
 // dequeueQueues is the polling order for the next dequeue (weights / strict priority, see
-// queueOrder) without the held parents' sub-queues.
+// queueOrder) without the sub-queues of held parents and of parents whose process is down.
+// Taking a task the process cannot run would only fail it and burn its retries: left in
+// the queue it waits for the restart, and its growing latency can trigger the autoscaler.
 func (p *processor) dequeueQueues() []string {
 	order := p.order.next()
 	p.heldMu.RLock()
 	defer p.heldMu.RUnlock()
-	if len(p.held) == 0 {
-		return order
-	}
 	out := make([]string, 0, len(order))
+	ready := make(map[string]bool, len(order))
 	for _, q := range order {
-		if !p.held[parentQueueName(q)] {
+		parent := parentQueueName(q)
+		if p.held[parent] {
+			continue
+		}
+		ok, seen := ready[parent]
+		if !seen {
+			ok = p.processReady(parent)
+			ready[parent] = ok
+		}
+		if ok {
 			out = append(out, q)
 		}
 	}
 	return out
+}
+
+// processReady reports whether the parent queue's process can take tasks, logging when
+// that changes.
+func (p *processor) processReady(parent string) bool {
+	state, ok := p.queueStates[parent]
+	healthy := !ok || state.processHealthy()
+	p.unhealthyMu.Lock()
+	defer p.unhealthyMu.Unlock()
+	if p.unhealthy[parent] == !healthy {
+		return healthy
+	}
+	if p.unhealthy == nil {
+		p.unhealthy = make(map[string]bool)
+	}
+	p.unhealthy[parent] = !healthy
+	if healthy {
+		p.logger.Info("[%s] Process healthy again — taking tasks", parent)
+	} else {
+		p.logger.Warn("[%s] Process is down — not taking tasks until it is healthy again (they stay pending)", parent)
+	}
+	return healthy
 }
 
 // activeFor counts in-flight tasks belonging to the given parent queues (all when none
@@ -325,7 +361,7 @@ func (p *processor) processOne(ctx context.Context) {
 
 	queues := p.dequeueQueues()
 	if len(queues) == 0 {
-		// Every queue is held (drained): wait instead of dequeuing.
+		// Every queue is held (drained) or its process is down: wait instead of dequeuing.
 		select {
 		case <-ctx.Done():
 		case <-p.stopping:
@@ -376,25 +412,19 @@ func (p *processor) processOne(ctx context.Context) {
 	// Extract parent queue for supervisor health check (sub-queue -> parent)
 	parentQueue := parentQueueName(queueName)
 
-	// Check if parent queue's supervisor is healthy
-	if state, ok := p.queueStates[parentQueue]; ok {
-		if state.Supervisor != nil && !state.Supervisor.IsHealthy() {
-			if state.Recovery != nil {
-				switch state.Recovery.State() {
-				case recoveryRecovering:
-					p.logger.Info("Queue %s recovering — restart attempt in progress, task will retry", parentQueue)
-				case recoveryDegraded:
-					p.logger.Error("Queue %s in degraded state — all recovery attempts exhausted, manual restart required", parentQueue)
-				default:
-					p.logger.Error("Queue %s is unhealthy — supervised process has crashed", parentQueue)
-				}
-			} else {
-				p.logger.Error("Queue %s is in degraded state — supervised process has crashed (no auto-recovery)", parentQueue)
-			}
-			// Fail the task so it can be retried later
-			p.handleError(ctx, task, queueName, fmt.Errorf("queue %s supervisor crashed", parentQueue))
+	// Safety net: dequeueQueues skips queues whose process is down, but the process can
+	// crash while BRPOP waits. Put that task back in pending (no retry spent); the next
+	// dequeues skip the queue until the process is healthy again.
+	if state, ok := p.queueStates[parentQueue]; ok && !state.processHealthy() {
+		n, err := redisClient.requeueActive(context.Background(), task.id, queueName)
+		if err == nil && n > 0 {
+			p.untrackInflight(task.id)
+			p.logger.Warn("Task %s returned to pending: queue %s process is down", task.id, parentQueue)
 			return
 		}
+		p.logger.Error("Queue %s process is down and task %s could not be returned to pending (%v): failing it", parentQueue, task.id, err)
+		p.handleError(ctx, task, queueName, fmt.Errorf("queue %s supervisor crashed", parentQueue))
+		return
 	}
 
 	// Pending timeout: if the task waited too long in :pending before being picked up,

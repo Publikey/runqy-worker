@@ -64,6 +64,7 @@ recovery:
   max_delay: "10m"
   backoff_factor: 3.0
   cooldown_period: "20m"
+  degraded_retry: "0"
 `
 	configPath := filepath.Join(tempDir, "config.yml")
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
@@ -92,6 +93,9 @@ recovery:
 	}
 	if cfg.Recovery.CooldownPeriod != 20*time.Minute {
 		t.Errorf("Recovery.CooldownPeriod = %v, want 20m", cfg.Recovery.CooldownPeriod)
+	}
+	if cfg.Recovery.DegradedRetry != 0 {
+		t.Errorf("Recovery.DegradedRetry = %v, want 0 (manual restart)", cfg.Recovery.DegradedRetry)
 	}
 }
 
@@ -136,6 +140,7 @@ func TestRecoveryConfigEnvVars(t *testing.T) {
 	t.Setenv("RUNQY_RECOVERY_INITIAL_DELAY", "3s")
 	t.Setenv("RUNQY_RECOVERY_MAX_DELAY", "15m")
 	t.Setenv("RUNQY_RECOVERY_COOLDOWN", "30m")
+	t.Setenv("RUNQY_RECOVERY_DEGRADED_RETRY", "30m")
 
 	// LoadConfig with nonexistent file falls back to env vars
 	cfg, err := LoadConfig("/nonexistent/config.yml")
@@ -157,6 +162,9 @@ func TestRecoveryConfigEnvVars(t *testing.T) {
 	}
 	if cfg.Recovery.CooldownPeriod != 30*time.Minute {
 		t.Errorf("Recovery.CooldownPeriod = %v, want 30m", cfg.Recovery.CooldownPeriod)
+	}
+	if cfg.Recovery.DegradedRetry != 30*time.Minute {
+		t.Errorf("Recovery.DegradedRetry = %v, want 30m", cfg.Recovery.DegradedRetry)
 	}
 }
 
@@ -587,4 +595,79 @@ func TestProcessRecovery_CooldownResets(t *testing.T) {
 	// The restarted process will also crash (same script), triggering another recovery.
 	// The key thing we verify is that the mechanism works end-to-end.
 	// For a true cooldown test, the process would need to stay alive for the cooldown period.
+}
+
+// A degraded process is tried again every DegradedRetry and recovers on the same machine
+// once its start-up works again.
+func TestProcessRecovery_DegradedRetryRecovers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	tempDir := t.TempDir()
+	marker := filepath.Join(tempDir, "broken")
+	// Crashes right after start-up while the marker exists, otherwise keeps running.
+	script := `import sys, os, json, time
+sys.stdout.write(json.dumps({"status": "ready"}) + chr(10))
+sys.stdout.flush()
+if os.path.exists(sys.argv[1]):
+    time.sleep(0.05)
+    sys.exit(1)
+for line in sys.stdin:
+    pass
+`
+	scriptPath := filepath.Join(tempDir, "task.py")
+	if err := os.WriteFile(scriptPath, []byte(script), 0644); err != nil {
+		t.Fatal(err)
+	}
+	pythonBin := "python3"
+	if runtime.GOOS == "windows" {
+		pythonBin = "python"
+	}
+	deployment := &DeploymentResult{RepoPath: tempDir, CodePath: tempDir, VenvPath: tempDir, VenvPython: pythonBin}
+	spec := BootstrapDeploymentConfig{StartupCmd: pythonBin + " " + scriptPath + " " + marker, StartupTimeoutSecs: 10}
+	if err := os.WriteFile(marker, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	logger := NewStdLogger()
+	supervisor := newProcessSupervisor(deployment, spec, nil, logger)
+	if err := supervisor.Start(t.Context()); err != nil {
+		t.Fatalf("failed to start supervisor: %v", err)
+	}
+	defer supervisor.Stop()
+
+	cfg := RecoveryConfig{Enabled: true, MaxRestarts: 2, InitialDelay: 50 * time.Millisecond, MaxDelay: 100 * time.Millisecond,
+		BackoffFactor: 1.5, CooldownPeriod: time.Minute, DegradedRetry: 500 * time.Millisecond}
+	recovery := newProcessRecovery("test-queue", supervisor, cfg, logger)
+	restarted := make(chan struct{}, 8)
+	recovery.SetOnRestart(func(*ProcessSupervisor) { restarted <- struct{}{} })
+	recovery.Start()
+	defer recovery.Stop()
+
+	// The process keeps crashing: recovery gives up and the process is degraded.
+	waitFor(t, 30*time.Second, func() bool { return recovery.State() == recoveryDegraded }, "degraded state")
+
+	// Fix start-up: the next degraded retry brings the process back.
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 30*time.Second, func() bool { return recovery.State() == recoveryIdle && supervisor.IsHealthy() }, "recovery from degraded state")
+	if recovery.ConsecutiveFails() != 0 {
+		t.Errorf("ConsecutiveFails = %d after recovering, want 0", recovery.ConsecutiveFails())
+	}
+	select {
+	case <-restarted:
+	default:
+		t.Error("onRestart not called: the stdio handler would keep the dead pipes")
+	}
+}
+
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for %s", what)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

@@ -361,6 +361,16 @@ func (h *StdioHandler) readResponses() {
 		h.logger.Error("Error reading stdout: %v", err)
 	}
 
+	// The process's output is closed: no response can arrive any more. Fail the tasks
+	// waiting for one now rather than when the process is restarted, which can take
+	// as long as loading a model (or never happen if it is degraded).
+	h.mu.Lock()
+	for taskID, ch := range h.pending {
+		close(ch)
+		delete(h.pending, taskID)
+	}
+	h.mu.Unlock()
+
 	h.logger.Info("Stdout reader stopped")
 }
 

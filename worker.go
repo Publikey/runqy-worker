@@ -38,6 +38,15 @@ type QueueState struct {
 	mu sync.RWMutex
 }
 
+// processHealthy reports whether the queue's long_running process can take tasks. One-shot
+// queues have no supervisor and are always ready.
+func (s *QueueState) processHealthy() bool {
+	s.mu.RLock()
+	sup := s.Supervisor
+	s.mu.RUnlock()
+	return sup == nil || sup.IsHealthy()
+}
+
 // processTask routes a task to the queue's current handler. Handlers are registered
 // through this indirection so a code update can swap them without touching the
 // processor's handler map.
@@ -503,14 +512,9 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 
 		// Set up auto-recovery for the supervised process
 		if w.config.Recovery.Enabled {
-			recovery := newProcessRecovery(parentQueue, state.Supervisor, w.config.Recovery, w.logger)
-			recovery.SetOnRestart(func(sup *ProcessSupervisor) {
-				state.StdioHandler.Reconnect(sup.Stdin(), sup.Stdout())
-			})
-			recovery.Start()
-			state.Recovery = recovery
-			w.logger.Info("[%s] Auto-recovery enabled (max_restarts=%d, cooldown=%v)",
-				parentQueue, w.config.Recovery.MaxRestarts, w.config.Recovery.CooldownPeriod)
+			state.Recovery = w.startRecovery(state, state.Supervisor)
+			w.logger.Info("[%s] Auto-recovery enabled (max_restarts=%d, cooldown=%v, degraded_retry=%v)",
+				parentQueue, w.config.Recovery.MaxRestarts, w.config.Recovery.CooldownPeriod, w.config.Recovery.DegradedRetry)
 		}
 
 		// Register handler only for configured sub-queues (they share the same stdio handler)
@@ -758,6 +762,16 @@ func (w *Worker) Run() error {
 		}
 	}
 	return err
+}
+
+// startRecovery watches a queue's long_running process and restarts it after a crash.
+func (w *Worker) startRecovery(state *QueueState, sup *ProcessSupervisor) *processRecovery {
+	recovery := newProcessRecovery(state.Name, sup, w.config.Recovery, w.logger)
+	recovery.SetOnRestart(func(s *ProcessSupervisor) {
+		state.StdioHandler.Reconnect(s.Stdin(), s.Stdout())
+	})
+	recovery.Start()
+	return recovery
 }
 
 // requestReexec asks Run() to shut down gracefully and re-execute path.

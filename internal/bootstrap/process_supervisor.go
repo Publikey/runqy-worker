@@ -36,6 +36,9 @@ type ProcessSupervisor struct {
 	crashed   bool
 	crashedAt time.Time
 	exitCode  int
+	// stopping is set by Stop: only an exit the worker asked for is a normal one. A
+	// process that exits on its own, even with status 0, can no longer run tasks.
+	stopping bool
 
 	restartCount int
 	lastRestart  time.Time
@@ -288,18 +291,24 @@ func (s *ProcessSupervisor) monitorProcess() {
 	if s.cmd.ProcessState != nil {
 		s.exitCode = s.cmd.ProcessState.ExitCode()
 	}
-	if err != nil || s.exitCode != 0 {
+	// A crash is any exit the worker did not ask for, whatever its status; an exit after
+	// Stop (SIGTERM, or a kill on Windows) is normal even when the status is not 0.
+	requested := s.stopping
+	if !requested {
 		s.crashed = true
 		s.crashedAt = time.Now()
 	}
 	s.mu.Unlock()
 
-	if err != nil {
+	switch {
+	case requested:
+		s.logger.Info("Process stopped (exit code: %d)", s.exitCode)
+	case err != nil && s.exitCode != 0:
 		s.logger.Error("Process exited with error: %v (exit code: %d)", err, s.exitCode)
-	} else if s.exitCode != 0 {
-		s.logger.Error("Process exited with non-zero exit code: %d", s.exitCode)
-	} else {
-		s.logger.Info("Process exited normally (exit code: 0)")
+	case err != nil:
+		s.logger.Error("Process exited with error: %v", err)
+	default:
+		s.logger.Error("Process exited on its own (exit code: 0) — treated as a crash")
 	}
 
 	close(s.done)
@@ -335,6 +344,10 @@ func (s *ProcessSupervisor) Stop() error {
 	}
 
 	s.logger.Info("Stopping supervised process (PID %d)...", s.cmd.Process.Pid)
+
+	s.mu.Lock()
+	s.stopping = true
+	s.mu.Unlock()
 
 	gracePeriod := 10 * time.Second
 
@@ -397,6 +410,7 @@ func (s *ProcessSupervisor) Restart(ctx context.Context) error {
 	s.crashed = false
 	s.crashedAt = time.Time{}
 	s.exitCode = 0
+	s.stopping = false
 	s.cmd = nil
 	s.stdin = nil
 	s.stdout = nil
