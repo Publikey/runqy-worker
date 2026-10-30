@@ -8,7 +8,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -217,19 +216,5 @@ func TestProcessorSkipsQueueWhoseProcessIsDown(t *testing.T) {
 	p.hold("b")
 	if got := p.dequeueQueues(); len(got) != 0 {
 		t.Errorf("dequeue queues = %v, want none (a down, b held)", got)
-	}
-}
-
-func TestExitDegradedStopsTheWorker(t *testing.T) {
-	w := newControlTestWorker()
-	w.exitDegraded("a")
-	w.exitDegraded("b") // a second degraded queue keeps the first reason
-	select {
-	case <-w.done:
-	default:
-		t.Fatal("worker not asked to shut down")
-	}
-	if !errors.Is(w.exitErr, ErrProcessDegraded) || !strings.Contains(w.exitErr.Error(), "queue a") {
-		t.Errorf("exitErr = %v, want ErrProcessDegraded for queue a", w.exitErr)
 	}
 }

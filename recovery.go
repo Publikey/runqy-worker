@@ -15,10 +15,9 @@ type RecoveryConfig struct {
 	MaxDelay       time.Duration // Maximum delay between restart attempts (default: 5m)
 	BackoffFactor  float64       // Multiplier for exponential backoff (default: 2.0)
 	CooldownPeriod time.Duration // Time without crash to reset consecutive failures (default: 10m)
-	// ExitOnDegraded stops the worker (exit status 1) once a process is degraded, so a
-	// container platform restarts it from scratch instead of keeping a worker that can no
-	// longer run tasks (default: false).
-	ExitOnDegraded bool
+	// DegradedRetry is how often a degraded process (circuit breaker tripped) is tried
+	// again, on the same machine. 0 waits for a manual restart (default: 10m).
+	DegradedRetry time.Duration
 }
 
 // DefaultRecoveryConfig returns a RecoveryConfig with sensible defaults.
@@ -30,6 +29,7 @@ func DefaultRecoveryConfig() RecoveryConfig {
 		MaxDelay:       5 * time.Minute,
 		BackoffFactor:  2.0,
 		CooldownPeriod: 10 * time.Minute,
+		DegradedRetry:  10 * time.Minute,
 	}
 }
 
@@ -56,11 +56,10 @@ type processRecovery struct {
 	totalRestarts    int
 	currentDelay     time.Duration // current backoff delay, reset by cooldown
 
-	onRestart  func(sup *ProcessSupervisor) // callback after successful restart
-	onDegraded func()                       // callback once the circuit breaker trips
-	restartCh  chan chan error              // planned restarts (e.g. after a task timeout)
-	done       chan struct{}
-	wg         sync.WaitGroup
+	onRestart func(sup *ProcessSupervisor) // callback after successful restart
+	restartCh chan chan error              // planned restarts (e.g. after a task timeout)
+	done      chan struct{}
+	wg        sync.WaitGroup
 }
 
 // newProcessRecovery creates a new processRecovery watcher.
@@ -98,18 +97,6 @@ func (r *processRecovery) RestartNow() error {
 // The callback receives the supervisor so it can access the new stdin/stdout pipes.
 func (r *processRecovery) SetOnRestart(fn func(sup *ProcessSupervisor)) {
 	r.onRestart = fn
-}
-
-// SetOnDegraded sets a callback invoked once the process enters the degraded state.
-func (r *processRecovery) SetOnDegraded(fn func()) {
-	r.onDegraded = fn
-}
-
-// notifyDegraded runs the degraded callback, if any.
-func (r *processRecovery) notifyDegraded() {
-	if r.onDegraded != nil {
-		r.onDegraded()
-	}
 }
 
 // Start begins watching the supervisor for crashes.
@@ -175,9 +162,11 @@ func (r *processRecovery) watchLoop() {
 				continue
 			}
 			if r.State() == recoveryDegraded {
-				r.logger.Error("[%s] Planned restart failed — entering degraded state (manual restart required)", r.queueName)
+				r.logger.Error("[%s] Planned restart failed — entering degraded state", r.queueName)
 				result <- fmt.Errorf("restart failed, process degraded")
-				r.notifyDegraded()
+				if r.retryWhileDegraded() {
+					continue
+				}
 			} else {
 				result <- fmt.Errorf("restart interrupted")
 			}
@@ -206,9 +195,11 @@ func (r *processRecovery) watchLoop() {
 				r.mu.Lock()
 				r.state = recoveryDegraded
 				r.mu.Unlock()
-				r.logger.Error("[%s] Max restarts reached (%d) — entering degraded state (manual restart required)",
+				r.logger.Error("[%s] Max restarts reached (%d) — entering degraded state",
 					r.queueName, r.config.MaxRestarts)
-				r.notifyDegraded()
+				if r.retryWhileDegraded() {
+					continue
+				}
 				return
 			}
 
@@ -232,11 +223,60 @@ func (r *processRecovery) watchLoop() {
 					// Shutdown interrupted, not degraded
 					return
 				}
-				r.logger.Error("[%s] Recovery failed — entering degraded state (manual restart required)", r.queueName)
-				r.notifyDegraded()
+				r.logger.Error("[%s] Recovery failed — entering degraded state", r.queueName)
+				if r.retryWhileDegraded() {
+					continue
+				}
 				return
 			}
 		}
+	}
+}
+
+// retryWhileDegraded tries a restart every DegradedRetry while the process is degraded,
+// so the worker recovers on its own machine (a rented one is kept) instead of waiting for
+// a manual restart. Meanwhile the worker takes no task for the queue. Returns true once
+// the process runs again (with fresh crash counters), false on shutdown or when
+// DegradedRetry is 0.
+func (r *processRecovery) retryWhileDegraded() bool {
+	if r.config.DegradedRetry <= 0 {
+		r.logger.Error("[%s] Degraded — manual restart required (recovery.degraded_retry is 0)", r.queueName)
+		return false
+	}
+	for {
+		r.logger.Warn("[%s] Degraded — next restart attempt in %v", r.queueName, r.config.DegradedRetry)
+		select {
+		case <-r.done:
+			return false
+		case <-time.After(r.config.DegradedRetry):
+		}
+
+		r.mu.Lock()
+		r.state = recoveryRecovering
+		r.mu.Unlock()
+		timeout := time.Duration(r.supervisor.TimeoutSec())*time.Second + 30*time.Second
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		err := r.supervisor.Restart(ctx)
+		cancel()
+		if err != nil {
+			r.logger.Error("[%s] Restart from degraded state failed: %v", r.queueName, err)
+			r.mu.Lock()
+			r.state = recoveryDegraded
+			r.mu.Unlock()
+			continue
+		}
+
+		r.mu.Lock()
+		r.totalRestarts++
+		r.consecutiveFails = 0
+		r.currentDelay = r.config.InitialDelay
+		r.state = recoveryIdle
+		r.mu.Unlock()
+		r.logger.Info("[%s] Process recovered from degraded state (total restarts: %d)", r.queueName, r.totalRestarts)
+		if r.onRestart != nil {
+			r.onRestart(r.supervisor)
+		}
+		return true
 	}
 }
 

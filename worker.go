@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -81,9 +80,7 @@ type Worker struct {
 	// reexecPath is set by worker_update: after a graceful shutdown, Run() re-executes
 	// this binary in place instead of returning.
 	reexecPath string
-	// exitErr is set by exitDegraded: Run() returns it after the graceful shutdown.
-	exitErr  error
-	reexecMu sync.Mutex // guards reexecPath and exitErr
+	reexecMu   sync.Mutex
 
 	// Multi-queue bootstrap state
 	queueStates  map[string]*QueueState
@@ -516,8 +513,8 @@ func (w *Worker) bootstrapQueueWithResponse(ctx context.Context, group *parentQu
 		// Set up auto-recovery for the supervised process
 		if w.config.Recovery.Enabled {
 			state.Recovery = w.startRecovery(state, state.Supervisor)
-			w.logger.Info("[%s] Auto-recovery enabled (max_restarts=%d, cooldown=%v, exit_on_degraded=%v)",
-				parentQueue, w.config.Recovery.MaxRestarts, w.config.Recovery.CooldownPeriod, w.config.Recovery.ExitOnDegraded)
+			w.logger.Info("[%s] Auto-recovery enabled (max_restarts=%d, cooldown=%v, degraded_retry=%v)",
+				parentQueue, w.config.Recovery.MaxRestarts, w.config.Recovery.CooldownPeriod, w.config.Recovery.DegradedRetry)
 		}
 
 		// Register handler only for configured sub-queues (they share the same stdio handler)
@@ -756,11 +753,8 @@ func (w *Worker) Run() error {
 
 	err := w.shutdown()
 	w.reexecMu.Lock()
-	path, exitErr := w.reexecPath, w.exitErr
+	path := w.reexecPath
 	w.reexecMu.Unlock()
-	if exitErr != nil {
-		return exitErr
-	}
 	if path != "" {
 		w.logger.Info("Re-executing %s...", path)
 		if execErr := reexec(path); execErr != nil {
@@ -776,26 +770,8 @@ func (w *Worker) startRecovery(state *QueueState, sup *ProcessSupervisor) *proce
 	recovery.SetOnRestart(func(s *ProcessSupervisor) {
 		state.StdioHandler.Reconnect(s.Stdin(), s.Stdout())
 	})
-	if w.config.Recovery.ExitOnDegraded {
-		recovery.SetOnDegraded(func() { w.exitDegraded(state.Name) })
-	}
 	recovery.Start()
 	return recovery
-}
-
-// ErrProcessDegraded is returned by Run when recovery.exit_on_degraded stopped the worker.
-var ErrProcessDegraded = errors.New("supervised process degraded")
-
-// exitDegraded stops the worker because a queue's process is degraded: Run() returns
-// ErrProcessDegraded after the usual graceful shutdown (other queues' tasks finish).
-func (w *Worker) exitDegraded(queue string) {
-	w.reexecMu.Lock()
-	if w.exitErr == nil {
-		w.exitErr = fmt.Errorf("%w: queue %s (exit_on_degraded)", ErrProcessDegraded, queue)
-	}
-	w.reexecMu.Unlock()
-	w.logger.Error("[%s] Process degraded and recovery.exit_on_degraded is set — stopping the worker so it can be restarted", queue)
-	w.Shutdown()
 }
 
 // requestReexec asks Run() to shut down gracefully and re-execute path.
