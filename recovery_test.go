@@ -64,6 +64,7 @@ recovery:
   max_delay: "10m"
   backoff_factor: 3.0
   cooldown_period: "20m"
+  exit_on_degraded: true
 `
 	configPath := filepath.Join(tempDir, "config.yml")
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
@@ -92,6 +93,9 @@ recovery:
 	}
 	if cfg.Recovery.CooldownPeriod != 20*time.Minute {
 		t.Errorf("Recovery.CooldownPeriod = %v, want 20m", cfg.Recovery.CooldownPeriod)
+	}
+	if !cfg.Recovery.ExitOnDegraded {
+		t.Error("expected Recovery.ExitOnDegraded=true")
 	}
 }
 
@@ -136,6 +140,7 @@ func TestRecoveryConfigEnvVars(t *testing.T) {
 	t.Setenv("RUNQY_RECOVERY_INITIAL_DELAY", "3s")
 	t.Setenv("RUNQY_RECOVERY_MAX_DELAY", "15m")
 	t.Setenv("RUNQY_RECOVERY_COOLDOWN", "30m")
+	t.Setenv("RUNQY_RECOVERY_EXIT_ON_DEGRADED", "true")
 
 	// LoadConfig with nonexistent file falls back to env vars
 	cfg, err := LoadConfig("/nonexistent/config.yml")
@@ -157,6 +162,9 @@ func TestRecoveryConfigEnvVars(t *testing.T) {
 	}
 	if cfg.Recovery.CooldownPeriod != 30*time.Minute {
 		t.Errorf("Recovery.CooldownPeriod = %v, want 30m", cfg.Recovery.CooldownPeriod)
+	}
+	if !cfg.Recovery.ExitOnDegraded {
+		t.Error("expected Recovery.ExitOnDegraded=true from env")
 	}
 }
 
@@ -587,4 +595,34 @@ func TestProcessRecovery_CooldownResets(t *testing.T) {
 	// The restarted process will also crash (same script), triggering another recovery.
 	// The key thing we verify is that the mechanism works end-to-end.
 	// For a true cooldown test, the process would need to stay alive for the cooldown period.
+}
+
+func TestProcessRecovery_DegradedCallback(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	tempDir := t.TempDir()
+	scriptPath, pythonBin := crashingHelperScript(t, tempDir, 50)
+	deployment := &DeploymentResult{RepoPath: tempDir, CodePath: tempDir, VenvPath: tempDir, VenvPython: pythonBin}
+	spec := BootstrapDeploymentConfig{StartupCmd: pythonBin + " " + scriptPath, StartupTimeoutSecs: 10}
+	logger := NewStdLogger()
+	supervisor := newProcessSupervisor(deployment, spec, nil, logger)
+	if err := supervisor.Start(t.Context()); err != nil {
+		t.Fatalf("failed to start supervisor: %v", err)
+	}
+	cfg := RecoveryConfig{Enabled: true, MaxRestarts: 1, InitialDelay: 50 * time.Millisecond, MaxDelay: 100 * time.Millisecond, BackoffFactor: 1.5, CooldownPeriod: time.Minute}
+	recovery := newProcessRecovery("test-queue", supervisor, cfg, logger)
+	degraded := make(chan struct{}, 4)
+	recovery.SetOnDegraded(func() { degraded <- struct{}{} })
+	recovery.Start()
+	defer recovery.Stop()
+
+	select {
+	case <-degraded:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("degraded callback not called, state %s", recovery.State())
+	}
+	if recovery.State() != recoveryDegraded {
+		t.Errorf("state = %s, want degraded", recovery.State())
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -199,5 +200,36 @@ func TestLastLineOfTraceback(t *testing.T) {
 	}
 	if got := lastLine("busy"); got != "busy" {
 		t.Fatalf("lastLine = %q", got)
+	}
+}
+
+func TestProcessorSkipsQueueWhoseProcessIsDown(t *testing.T) {
+	p := newProcessor(nil, NewServeMux(), Config{Queues: map[string]int{"a.high": 2, "a.low": 1, "b.default": 1}, Logger: NewStdLogger()})
+	down := newProcessSupervisor(&DeploymentResult{}, BootstrapDeploymentConfig{}, nil, NewStdLogger()) // never started: unhealthy
+	// b has no supervisor (one_shot mode): always ready.
+	p.SetQueueStates(map[string]*QueueState{"a": {Name: "a", Supervisor: down}, "b": {Name: "b"}})
+	for i := 0; i < 20; i++ { // the order is redrawn at every call
+		got := p.dequeueQueues()
+		if len(got) != 1 || got[0] != "b.default" {
+			t.Fatalf("dequeue queues = %v, want only b.default while a's process is down", got)
+		}
+	}
+	p.hold("b")
+	if got := p.dequeueQueues(); len(got) != 0 {
+		t.Errorf("dequeue queues = %v, want none (a down, b held)", got)
+	}
+}
+
+func TestExitDegradedStopsTheWorker(t *testing.T) {
+	w := newControlTestWorker()
+	w.exitDegraded("a")
+	w.exitDegraded("b") // a second degraded queue keeps the first reason
+	select {
+	case <-w.done:
+	default:
+		t.Fatal("worker not asked to shut down")
+	}
+	if !errors.Is(w.exitErr, ErrProcessDegraded) || !strings.Contains(w.exitErr.Error(), "queue a") {
+		t.Errorf("exitErr = %v, want ErrProcessDegraded for queue a", w.exitErr)
 	}
 }

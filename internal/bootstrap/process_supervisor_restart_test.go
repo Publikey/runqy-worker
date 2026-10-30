@@ -268,3 +268,55 @@ for line in sys.stdin:
 
 	supervisor.Stop()
 }
+
+// A process that exits on its own with status 0 can no longer run tasks: it must count
+// as a crash (and be restarted by recovery), while an exit asked by Stop is normal.
+func TestProcessSupervisor_UnrequestedExitIsACrash(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	tempDir := t.TempDir()
+	pythonBin := "python3"
+	if runtime.GOOS == "windows" {
+		pythonBin = "python"
+	}
+	script := `import sys, json, os, time
+sys.stdout.write(json.dumps({"status": "ready"}) + chr(10))
+sys.stdout.flush()
+if os.environ.get("EXIT_ZERO"):
+    time.sleep(0.2)
+    sys.exit(0)
+for line in sys.stdin:
+    pass
+`
+	scriptPath := filepath.Join(tempDir, "task.py")
+	if err := os.WriteFile(scriptPath, []byte(script), 0644); err != nil {
+		t.Fatal(err)
+	}
+	deployment := &DeploymentResult{RepoPath: tempDir, CodePath: tempDir, VenvPath: tempDir, VenvPython: pythonBin}
+	spec := DeploymentConfig{StartupCmd: pythonBin + " " + scriptPath, StartupTimeoutSecs: 10}
+
+	exiting := NewProcessSupervisor(deployment, spec, map[string]string{"EXIT_ZERO": "1"}, newTestLogger())
+	if err := exiting.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	select {
+	case <-exiting.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("process did not exit")
+	}
+	if !exiting.HasCrashed() {
+		t.Error("exit status 0 not asked by Stop must count as a crash")
+	}
+
+	stopped := NewProcessSupervisor(deployment, spec, nil, newTestLogger())
+	if err := stopped.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if err := stopped.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	if stopped.HasCrashed() {
+		t.Error("an exit asked by Stop must not count as a crash")
+	}
+}

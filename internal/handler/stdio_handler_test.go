@@ -206,3 +206,28 @@ func TestStdioHandler_Control(t *testing.T) {
 		t.Error("Control without an answer should time out")
 	}
 }
+
+// When the process's stdout closes (it exited), tasks waiting for a response fail at once
+// instead of waiting for a restart that can take minutes or never come.
+func TestStdioHandler_FailsPendingTasksWhenOutputCloses(t *testing.T) {
+	stdoutR, stdoutW := io.Pipe()
+	h := NewStdioHandler(&bytes.Buffer{}, stdoutR, &testLogger{}, false)
+	h.Start()
+
+	taskDone := make(chan error, 1)
+	go func() {
+		taskDone <- h.ProcessTask(context.Background(), &mockTask{id: "t1", typeName: "test", payload: []byte(`{}`), queue: "q"})
+	}()
+	time.Sleep(100 * time.Millisecond) // let the task register as pending
+
+	stdoutW.Close() // the process exited
+	select {
+	case err := <-taskDone:
+		if err == nil {
+			t.Error("expected an error for a task whose process exited")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("task still waiting after the process output closed")
+	}
+	h.Stop()
+}
