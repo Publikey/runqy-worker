@@ -80,8 +80,11 @@ func (lr *leaseRecoverer) recover() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// 30-second buffer to accommodate clock skew (same as asynq's recoverer)
-	cutoff := time.Now().Add(-30 * time.Second)
+	// Judge expiry on the Redis server clock, the same clock the lease scores are written
+	// with (by whichever worker owns the task). A host whose own clock ran ahead used to
+	// recover live tasks of other workers, which then ran twice. The 30-second buffer
+	// (same as asynq's recoverer) stays for a lease renewal in flight.
+	cutoff := rdb.serverNow(ctx).Add(-30 * time.Second)
 
 	// Deduplicate queues (defensive: callers may pass repeated names)
 	seen := make(map[string]bool, len(lr.queues))
@@ -103,11 +106,11 @@ func (lr *leaseRecoverer) recoverQueue(ctx context.Context, rdb *redisClient, qu
 	}
 
 	for _, task := range tasks {
-		lr.recoverTask(ctx, rdb, task, queue)
+		lr.recoverTask(ctx, rdb, task, queue, cutoff)
 	}
 }
 
-func (lr *leaseRecoverer) recoverTask(ctx context.Context, rdb *redisClient, task *iredis.TaskData, queue string) {
+func (lr *leaseRecoverer) recoverTask(ctx context.Context, rdb *redisClient, task *iredis.TaskData, queue string, cutoff time.Time) {
 	// Orphaned task (hash deleted) — just clean up active + lease
 	if task.Type == "" && task.MaxRetry == 0 && task.Retry == 0 {
 		if err := rdb.recoverOrphaned(ctx, task.ID, queue); err != nil {
@@ -121,22 +124,29 @@ func (lr *leaseRecoverer) recoverTask(ctx context.Context, rdb *redisClient, tas
 	if task.Retry < task.MaxRetry {
 		// Retry with exponential backoff based on retry count
 		delay := defaultRecoverRetryDelay(task.Retry + 1)
-		if err := rdb.recoverToRetry(ctx, task, queue, delay); err != nil {
+		ok, err := rdb.recoverToRetry(ctx, task, queue, delay, cutoff)
+		switch {
+		case err != nil:
 			lr.logger.Error("Lease recoverer: failed to retry task %s: %v", task.ID, err)
-		} else {
+		case ok:
 			lr.logger.Warn("Lease recoverer: recovered task %s to retry (queue=%s, attempt=%d/%d)",
 				task.ID, queue, task.Retry+1, task.MaxRetry)
+		default:
+			lr.logger.Debug("Lease recoverer: task %s renewed or finished since listing, left alone", task.ID)
 		}
 	} else {
-		if err := rdb.recoverToArchive(ctx, task, queue); err != nil {
+		ok, err := rdb.recoverToArchive(ctx, task, queue, cutoff)
+		switch {
+		case err != nil:
 			lr.logger.Error("Lease recoverer: failed to archive task %s: %v", task.ID, err)
-		} else {
+		case ok:
 			lr.logger.Warn("Lease recoverer: archived expired task %s (queue=%s, max retries exceeded)",
 				task.ID, queue)
-		}
-		// Increment failed counter
-		if err := rdb.incrementFailed(ctx, queue); err != nil {
-			lr.logger.Error("Lease recoverer: failed to increment failed counter for queue %s: %v", queue, err)
+			if err := rdb.incrementFailed(ctx, queue); err != nil {
+				lr.logger.Error("Lease recoverer: failed to increment failed counter for queue %s: %v", queue, err)
+			}
+		default:
+			lr.logger.Debug("Lease recoverer: task %s renewed or finished since listing, left alone", task.ID)
 		}
 	}
 }

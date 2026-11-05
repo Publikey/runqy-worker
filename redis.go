@@ -131,14 +131,20 @@ func (r *redisClient) listLeaseExpired(ctx context.Context, queueName string, cu
 	return r.internal.ListLeaseExpired(ctx, queueName, cutoff)
 }
 
-// recoverToRetry moves an expired-lease task to retry with delay.
-func (r *redisClient) recoverToRetry(ctx context.Context, task *redis.TaskData, queueName string, delay time.Duration) error {
-	return r.internal.RecoverToRetry(ctx, task, queueName, delay)
+// recoverToRetry moves an expired-lease task to retry with delay, if its lease is still
+// expired at cutoff and it is still active. Reports whether it did.
+func (r *redisClient) recoverToRetry(ctx context.Context, task *redis.TaskData, queueName string, delay time.Duration, cutoff time.Time) (bool, error) {
+	return r.internal.RecoverToRetry(ctx, task, queueName, delay, cutoff)
 }
 
-// recoverToArchive moves an expired-lease task to archived.
-func (r *redisClient) recoverToArchive(ctx context.Context, task *redis.TaskData, queueName string) error {
-	return r.internal.RecoverToArchive(ctx, task, queueName)
+// recoverToArchive moves an expired-lease task to archived (same re-check as recoverToRetry).
+func (r *redisClient) recoverToArchive(ctx context.Context, task *redis.TaskData, queueName string, cutoff time.Time) (bool, error) {
+	return r.internal.RecoverToArchive(ctx, task, queueName, cutoff)
+}
+
+// serverNow is the Redis server's clock (shared by every worker; see Client.ServerNow).
+func (r *redisClient) serverNow(ctx context.Context) time.Time {
+	return r.internal.ServerNow(ctx)
 }
 
 // recoverOrphaned removes an orphaned task from active and lease.

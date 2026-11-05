@@ -403,7 +403,7 @@ func (r *Client) Dequeue(ctx context.Context, queues []string, leaseDuration tim
 	if leaseDuration <= 0 {
 		leaseDuration = 2 * time.Minute
 	}
-	leaseExpiration := float64(time.Now().Add(leaseDuration).Unix())
+	leaseExpiration := float64(r.ServerNow(ctx).Add(leaseDuration).Unix())
 
 	activateScript := redis.NewScript(`
 		redis.call("LPUSH", KEYS[1], ARGV[1])
@@ -456,12 +456,18 @@ func (r *Client) Dequeue(ctx context.Context, queues []string, leaseDuration tim
 const neverExpireSeconds = int64(100 * 365 * 24 * 3600)
 
 // completeCmd atomically removes a task from active/lease and marks it as completed.
-// KEYS[1] = activeKey, KEYS[2] = leaseKey, KEYS[3] = completedKey, KEYS[4] = taskKey
+// It also removes the task from retry and pending: if a lease recoverer moved the task
+// to retry while it was still running (expired lease), the success wins and the task is
+// not run a second time.
+// KEYS[1] = activeKey, KEYS[2] = leaseKey, KEYS[3] = completedKey, KEYS[4] = taskKey,
+// KEYS[5] = retryKey, KEYS[6] = pendingKey
 // ARGV[1] = taskID, ARGV[2] = now (unix), ARGV[3] = state, ARGV[4] = ttl (seconds, 0 = no expiry),
 // ARGV[5] = expiry score (unix seconds the entry becomes purgeable by the janitor)
 var completeCmd = redis.NewScript(`
 redis.call("LREM", KEYS[1], 0, ARGV[1])
 redis.call("ZREM", KEYS[2], ARGV[1])
+redis.call("ZREM", KEYS[5], ARGV[1])
+redis.call("LREM", KEYS[6], 0, ARGV[1])
 redis.call("ZADD", KEYS[3], ARGV[5], ARGV[1])
 redis.call("HSET", KEYS[4], "state", ARGV[3], "completed_at", ARGV[2])
 if tonumber(ARGV[4]) > 0 then
@@ -487,6 +493,8 @@ func (r *Client) Complete(ctx context.Context, taskID string, queueName string, 
 	activeKey := fmt.Sprintf(KeyActive, queueName)
 	leaseKey := fmt.Sprintf(KeyLease, queueName)
 	completedKey := fmt.Sprintf(KeyCompleted, queueName)
+	retryKey := fmt.Sprintf(KeyRetry, queueName)
+	pendingKey := fmt.Sprintf(KeyPending, queueName)
 
 	now := time.Now().Unix()
 
@@ -505,7 +513,7 @@ func (r *Client) Complete(ctx context.Context, taskID string, queueName string, 
 		ttlSecs = int64(ttl.Seconds())
 	}
 	if err := completeCmd.Run(ctx, r.Rdb,
-		[]string{activeKey, leaseKey, completedKey, taskKey},
+		[]string{activeKey, leaseKey, completedKey, taskKey, retryKey, pendingKey},
 		taskID, now, StateCompleted, ttlSecs, expiryScore(now, ttl),
 	).Err(); err != nil {
 		return fmt.Errorf("complete script failed for task %s: %w", taskID, err)
@@ -900,8 +908,18 @@ func (r *Client) ListLeaseExpired(ctx context.Context, queueName string, cutoff 
 }
 
 // recoverToRetryCmd atomically removes from active/lease and adds to retry sorted set.
+// Re-checked inside the script (the listing is not atomic with it): the lease must still
+// be expired (score <= ARGV[4], the cutoff) and the task still active. A lease renewed or
+// a task completed since the listing is left alone. Returns 1 when recovered, else 0.
 var recoverToRetryCmd = redis.NewScript(`
-redis.call("LREM", KEYS[1], 0, ARGV[1])
+local score = redis.call("ZSCORE", KEYS[2], ARGV[1])
+if not score or tonumber(score) > tonumber(ARGV[4]) then
+    return 0
+end
+if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then
+    redis.call("ZREM", KEYS[2], ARGV[1])
+    return 0
+end
 redis.call("ZREM", KEYS[2], ARGV[1])
 redis.call("ZADD", KEYS[3], ARGV[2], ARGV[1])
 redis.call("HINCRBY", KEYS[4], "retried", 1)
@@ -909,8 +927,9 @@ redis.call("HSET", KEYS[4], "state", "retry", "error_msg", "lease expired", "las
 return 1
 `)
 
-// RecoverToRetry moves an expired-lease task from active to retry with a delay.
-func (r *Client) RecoverToRetry(ctx context.Context, task *TaskData, queueName string, delay time.Duration) error {
+// RecoverToRetry moves an expired-lease task from active to retry with a delay, if its
+// lease is still expired at cutoff and it is still active. Reports whether it did.
+func (r *Client) RecoverToRetry(ctx context.Context, task *TaskData, queueName string, delay time.Duration, cutoff time.Time) (bool, error) {
 	activeKey := fmt.Sprintf(KeyActive, queueName)
 	leaseKey := fmt.Sprintf(KeyLease, queueName)
 	retryKey := fmt.Sprintf(KeyRetry, queueName)
@@ -919,26 +938,36 @@ func (r *Client) RecoverToRetry(ctx context.Context, task *TaskData, queueName s
 	now := time.Now()
 	retryAt := float64(now.Add(delay).Unix())
 
-	if err := recoverToRetryCmd.Run(ctx, r.Rdb,
+	n, err := recoverToRetryCmd.Run(ctx, r.Rdb,
 		[]string{activeKey, leaseKey, retryKey, taskKey},
-		task.ID, retryAt, now.Unix(),
-	).Err(); err != nil {
-		return fmt.Errorf("recover-to-retry script failed for task %s: %w", task.ID, err)
+		task.ID, retryAt, now.Unix(), cutoff.Unix(),
+	).Int()
+	if err != nil {
+		return false, fmt.Errorf("recover-to-retry script failed for task %s: %w", task.ID, err)
 	}
-	return nil
+	return n == 1, nil
 }
 
-// recoverToArchiveCmd atomically removes from active/lease and archives a task.
+// recoverToArchiveCmd atomically removes from active/lease and archives a task, with the
+// same re-check as recoverToRetryCmd (ARGV[4] = cutoff). Returns 1 when archived, else 0.
 var recoverToArchiveCmd = redis.NewScript(`
-redis.call("LREM", KEYS[1], 0, ARGV[1])
+local score = redis.call("ZSCORE", KEYS[2], ARGV[1])
+if not score or tonumber(score) > tonumber(ARGV[4]) then
+    return 0
+end
+if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then
+    redis.call("ZREM", KEYS[2], ARGV[1])
+    return 0
+end
 redis.call("ZREM", KEYS[2], ARGV[1])
 redis.call("ZADD", KEYS[3], ARGV[2], ARGV[1])
 redis.call("HSET", KEYS[4], "state", "archived", "error_msg", "lease expired: max retries exceeded", "last_failed_at", ARGV[2])
 return 1
 `)
 
-// RecoverToArchive moves an expired-lease task from active to archived.
-func (r *Client) RecoverToArchive(ctx context.Context, task *TaskData, queueName string) error {
+// RecoverToArchive moves an expired-lease task from active to archived, with the same
+// re-check as RecoverToRetry. Reports whether it did.
+func (r *Client) RecoverToArchive(ctx context.Context, task *TaskData, queueName string, cutoff time.Time) (bool, error) {
 	activeKey := fmt.Sprintf(KeyActive, queueName)
 	leaseKey := fmt.Sprintf(KeyLease, queueName)
 	archivedKey := fmt.Sprintf(KeyArchived, queueName)
@@ -946,13 +975,14 @@ func (r *Client) RecoverToArchive(ctx context.Context, task *TaskData, queueName
 
 	now := time.Now().Unix()
 
-	if err := recoverToArchiveCmd.Run(ctx, r.Rdb,
+	n, err := recoverToArchiveCmd.Run(ctx, r.Rdb,
 		[]string{activeKey, leaseKey, archivedKey, taskKey},
-		task.ID, now,
-	).Err(); err != nil {
-		return fmt.Errorf("recover-to-archive script failed for task %s: %w", task.ID, err)
+		task.ID, now, "", cutoff.Unix(),
+	).Int()
+	if err != nil {
+		return false, fmt.Errorf("recover-to-archive script failed for task %s: %w", task.ID, err)
 	}
-	return nil
+	return n == 1, nil
 }
 
 // recoverOrphanedCmd removes orphaned entries from active list and lease set (no task hash to update).
@@ -976,6 +1006,18 @@ func (r *Client) RecoverOrphaned(ctx context.Context, taskID string, queueName s
 	return nil
 }
 
+// ServerNow is the Redis server's clock. Lease scores are written by one worker and
+// judged expired by the recoverer of ANY other worker: with each host's local clock, a
+// host running ahead (common on rented GPU boxes) saw live leases as expired and moved
+// running tasks to retry, so they ran twice. One shared clock removes the skew. Falls
+// back to the local clock if TIME fails.
+func (r *Client) ServerNow(ctx context.Context) time.Time {
+	if t, err := r.Rdb.Time(ctx).Result(); err == nil {
+		return t
+	}
+	return time.Now()
+}
+
 // ExtendLease renews the lease of an in-flight task, pushing its expiration to
 // now+leaseDuration. It uses ZADD with XX so a task whose lease was already
 // removed (e.g. it just completed) is NOT re-added — this avoids resurrecting a
@@ -986,7 +1028,7 @@ func (r *Client) ExtendLease(ctx context.Context, taskID, queueName string, leas
 		leaseDuration = 2 * time.Minute
 	}
 	leaseKey := fmt.Sprintf(KeyLease, queueName)
-	expiration := float64(time.Now().Add(leaseDuration).Unix())
+	expiration := float64(r.ServerNow(ctx).Add(leaseDuration).Unix())
 	if err := r.Rdb.ZAddArgs(ctx, leaseKey, redis.ZAddArgs{
 		XX:      true,
 		Members: []redis.Z{{Score: expiration, Member: taskID}},
