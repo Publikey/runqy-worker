@@ -671,3 +671,28 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string)
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// A planned restart (task timeout) must not block when the process is degraded or the
+// watch loop has exited: the task would stay active forever and a drain never finish.
+func TestProcessRecovery_RestartNowDoesNotBlock(t *testing.T) {
+	cases := map[string]func(r *processRecovery){
+		"degraded":    func(r *processRecovery) { r.state = recoveryDegraded },
+		"loop exited": func(r *processRecovery) { close(r.loopDone) },
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := newProcessRecovery("test-queue", nil, DefaultRecoveryConfig(), NewStdLogger())
+			setup(r)
+			errc := make(chan error, 1)
+			go func() { errc <- r.RestartNow() }()
+			select {
+			case err := <-errc:
+				if err == nil {
+					t.Fatal("expected an error, got nil")
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("RestartNow blocked")
+			}
+		})
+	}
+}

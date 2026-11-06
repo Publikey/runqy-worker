@@ -59,6 +59,7 @@ type processRecovery struct {
 	onRestart func(sup *ProcessSupervisor) // callback after successful restart
 	restartCh chan chan error              // planned restarts (e.g. after a task timeout)
 	done      chan struct{}
+	loopDone  chan struct{} // closed when watchLoop returns (nobody serves restartCh any more)
 	wg        sync.WaitGroup
 }
 
@@ -72,24 +73,36 @@ func newProcessRecovery(queueName string, supervisor *ProcessSupervisor, config 
 		state:      recoveryIdle,
 		restartCh:  make(chan chan error),
 		done:       make(chan struct{}),
+		loopDone:   make(chan struct{}),
 	}
 }
 
 // RestartNow asks the watch loop to restart the process right away and waits for the
 // outcome. Unlike a crash it does not count toward the circuit breaker (unless the
 // restart itself fails). Running it in the watch loop avoids racing with crash recovery.
+//
+// It never blocks on a degraded process or a watch loop that has exited (circuit breaker
+// with degraded_retry 0): the caller holds a task slot, and waiting there would leave the
+// task active forever and keep a drain from ever completing.
 func (r *processRecovery) RestartNow() error {
+	if st := r.State(); st == recoveryDegraded {
+		return fmt.Errorf("process is %s", st)
+	}
 	result := make(chan error, 1)
 	select {
 	case r.restartCh <- result:
 	case <-r.done:
 		return fmt.Errorf("recovery stopped")
+	case <-r.loopDone:
+		return fmt.Errorf("recovery stopped (process %s)", r.State())
 	}
 	select {
 	case err := <-result:
 		return err
 	case <-r.done:
 		return fmt.Errorf("recovery stopped")
+	case <-r.loopDone:
+		return fmt.Errorf("recovery stopped (process %s)", r.State())
 	}
 }
 
@@ -140,6 +153,7 @@ func (r *processRecovery) TotalRestarts() int {
 // watchLoop monitors the supervisor and triggers recovery on crash.
 func (r *processRecovery) watchLoop() {
 	defer r.wg.Done()
+	defer close(r.loopDone)
 
 	r.mu.Lock()
 	r.currentDelay = r.config.InitialDelay
@@ -245,10 +259,18 @@ func (r *processRecovery) retryWhileDegraded() bool {
 	}
 	for {
 		r.logger.Warn("[%s] Degraded — next restart attempt in %v", r.queueName, r.config.DegradedRetry)
-		select {
-		case <-r.done:
-			return false
-		case <-time.After(r.config.DegradedRetry):
+		wait := time.After(r.config.DegradedRetry)
+	waiting:
+		for {
+			select {
+			case <-r.done:
+				return false
+			case result := <-r.restartCh:
+				// A planned restart (task timeout) while degraded: nothing runs, answer now.
+				result <- fmt.Errorf("process is %s", recoveryDegraded)
+			case <-wait:
+				break waiting
+			}
 		}
 
 		r.mu.Lock()
