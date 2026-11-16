@@ -15,10 +15,17 @@ import (
 // Strict (per parent queue, strict_priority): the parent's sub-queues are always polled in
 // descending priority, so a lower sub-queue is only served when the higher ones are empty.
 // Between different parent queues on the same worker, the order stays weighted.
+//
+// Idle-only (priority 0): a queue of priority 0 is always polled after every queue of
+// priority >= 1 the worker listens on, whatever their parent. It is served only when all of
+// those are empty, so it uses spare capacity and never delays another queue's task. Several
+// idle-only queues are shuffled evenly between themselves.
 type queueOrder struct {
-	names   []string        // unique queue names, sorted (stable list for the maintenance loops)
-	weights map[string]int  // queue -> weight (>= 1)
-	strict  map[string]bool // parent queue -> strict priority
+	names    []string        // unique queue names, sorted (stable list for the maintenance loops)
+	weighted []string        // queues of priority >= 1, sorted
+	idle     []string        // queues of priority 0, sorted
+	weights  map[string]int  // queue -> weight (0 = idle-only)
+	strict   map[string]bool // parent queue -> strict priority
 }
 
 func newQueueOrder(queueWeights map[string]int, strictParents map[string]bool) *queueOrder {
@@ -28,13 +35,20 @@ func newQueueOrder(queueWeights map[string]int, strictParents map[string]bool) *
 		strict:  make(map[string]bool, len(strictParents)),
 	}
 	for q, w := range queueWeights {
-		if w < 1 {
-			w = 1 // a queue the worker listens on must stay reachable
+		if w < 0 {
+			w = 0
 		}
 		o.names = append(o.names, q)
 		o.weights[q] = w
 	}
 	sort.Strings(o.names)
+	for _, q := range o.names {
+		if o.weights[q] > 0 {
+			o.weighted = append(o.weighted, q)
+		} else {
+			o.idle = append(o.idle, q)
+		}
+	}
 	for parent, s := range strictParents {
 		if s {
 			o.strict[parent] = true
@@ -52,7 +66,7 @@ func (o *queueOrder) next() []string {
 	// Weighted draw without replacement: same distribution as asynq's shuffle of the
 	// weight-expanded list followed by dedup.
 	out := make([]string, 0, len(o.names))
-	remaining := append([]string(nil), o.names...)
+	remaining := append([]string(nil), o.weighted...)
 	total := 0
 	for _, q := range remaining {
 		total += o.weights[q]
@@ -70,6 +84,13 @@ func (o *queueOrder) next() []string {
 		total -= o.weights[remaining[i]]
 		remaining = append(remaining[:i], remaining[i+1:]...)
 	}
+
+	// Idle-only queues come last, in a fresh even shuffle.
+	tail := len(out)
+	out = append(out, o.idle...)
+	rand.Shuffle(len(o.idle), func(i, j int) {
+		out[tail+i], out[tail+j] = out[tail+j], out[tail+i]
+	})
 
 	if len(o.strict) > 0 {
 		o.applyStrict(out)
