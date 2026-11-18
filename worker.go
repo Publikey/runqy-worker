@@ -689,6 +689,7 @@ func (w *Worker) Run() error {
 		w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates, "running")
 	}
 	w.heartbeat.setActivitySource(w.processor.activity)
+	w.heartbeat.setQueueActivitySource(w.processor.activityByQueue)
 
 	// Create retry forwarder — scans retry sorted sets and moves ready tasks to pending
 	w.forwarder = newRetryForwarder(redisClient, &w.processor.redisMu, w.processor.queues, 5*time.Second, w.logger)
@@ -816,6 +817,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		w.heartbeat = newHeartbeat(w.rdb, w.config, w.queueStates, "running")
 	}
 	w.heartbeat.setActivitySource(w.processor.activity)
+	w.heartbeat.setQueueActivitySource(w.processor.activityByQueue)
 
 	// Create retry forwarder — scans retry sorted sets and moves ready tasks to pending
 	w.forwarder = newRetryForwarder(redisClient, &w.processor.redisMu, w.processor.queues, 5*time.Second, w.logger)

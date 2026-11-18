@@ -18,7 +18,8 @@ import (
 //
 // Idle-only (priority 0): a queue of priority 0 is always polled after every queue of
 // priority >= 1 the worker listens on, whatever their parent. It is served only when all of
-// those are empty, so it uses spare capacity and never delays another queue's task. Several
+// those are empty, so it uses spare capacity. There is no preemption: an idle-only task that
+// has started runs to its end, and a task arriving meanwhile waits for a free slot. Several
 // idle-only queues are shuffled evenly between themselves.
 type queueOrder struct {
 	names    []string        // unique queue names, sorted (stable list for the maintenance loops)
