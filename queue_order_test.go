@@ -111,3 +111,66 @@ func TestQueueOrderSingleQueue(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+// A priority 0 queue is polled after every weighted queue, whatever its parent: it is only
+// served when all of them are empty.
+func TestQueueOrderIdleOnlyAlwaysLast(t *testing.T) {
+	o := newQueueOrder(
+		map[string]int{"a.priority": 7, "a.normal": 2, "a.free": 0, "b.default": 3},
+		nil,
+	)
+	firsts := map[string]int{}
+	for i := 0; i < 5000; i++ {
+		got := o.next()
+		if len(got) != 4 || got[3] != "a.free" {
+			t.Fatalf("got %v, want a.free last", got)
+		}
+		firsts[got[0]]++
+	}
+	// the weighted draw between the other queues is unchanged (7 / 2 / 3)
+	for q, want := range map[string]float64{"a.priority": 7.0 / 12, "a.normal": 2.0 / 12, "b.default": 3.0 / 12} {
+		if got := float64(firsts[q]) / 5000; got < want-0.04 || got > want+0.04 {
+			t.Errorf("%s first %.3f of the time, want ~%.2f", q, got, want)
+		}
+	}
+}
+
+// Several idle-only queues stay behind the weighted ones and share the tail evenly.
+func TestQueueOrderIdleOnlyShuffled(t *testing.T) {
+	o := newQueueOrder(map[string]int{"a.normal": 2, "a.free": 0, "b.free": 0}, nil)
+	const n = 10000
+	aBeforeB := 0
+	for i := 0; i < n; i++ {
+		got := o.next()
+		if got[0] != "a.normal" {
+			t.Fatalf("got %v, want a.normal first", got)
+		}
+		if got[1] == "a.free" {
+			aBeforeB++
+		}
+	}
+	if ratio := float64(aBeforeB) / n; ratio < 0.46 || ratio > 0.54 {
+		t.Fatalf("a.free before b.free %.3f of the time, want ~0.50", ratio)
+	}
+}
+
+func TestQueueOrderIdleOnlyWithStrictParent(t *testing.T) {
+	o := newQueueOrder(
+		map[string]int{"a.priority": 7, "a.normal": 2, "a.free": 0},
+		map[string]bool{"a": true},
+	)
+	want := []string{"a.priority", "a.normal", "a.free"}
+	for i := 0; i < 200; i++ {
+		if got := o.next(); !reflect.DeepEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+}
+
+// A worker listening only on idle-only queues still serves them.
+func TestQueueOrderOnlyIdleQueues(t *testing.T) {
+	o := newQueueOrder(map[string]int{"a.free": 0, "b.free": 0}, nil)
+	if got := o.next(); len(got) != 2 {
+		t.Fatalf("got %v, want both queues", got)
+	}
+}

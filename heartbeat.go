@@ -29,8 +29,9 @@ type heartbeat struct {
 	logBuffer  *LogBuffer // log buffer for streaming logs to Redis
 	lastLogSeq uint64     // last flushed log sequence number
 
-	activityFn func() (active int, lastTaskAt time.Time) // processor activity (nil until processing starts)
-	activityMu sync.RWMutex
+	activityFn        func() (active int, lastTaskAt time.Time) // processor activity (nil until processing starts)
+	activityByQueueFn func() map[string]queueActivity           // same, per sub-queue
+	activityMu        sync.RWMutex
 
 	controlFn func(data map[string]interface{}) // control channel state (nil until listening)
 }
@@ -389,11 +390,20 @@ func (h *heartbeat) setActivitySource(fn func() (active int, lastTaskAt time.Tim
 	h.activityMu.Unlock()
 }
 
+// setQueueActivitySource wires the processor's per-sub-queue activity into the heartbeat.
+func (h *heartbeat) setQueueActivitySource(fn func() map[string]queueActivity) {
+	h.activityMu.Lock()
+	h.activityByQueueFn = fn
+	h.activityMu.Unlock()
+}
+
 // addActivity adds "active" (in-flight task count) and, once a task has run,
-// "last_task_at" (unix seconds) to the heartbeat fields.
+// "last_task_at" (unix seconds) to the heartbeat fields, plus "activity": the same two
+// figures per sub-queue as JSON ({"q.high":{"active":1,"last_task_at":1700000000}}).
 func (h *heartbeat) addActivity(data map[string]interface{}) {
 	h.activityMu.RLock()
 	fn := h.activityFn
+	byQueue := h.activityByQueueFn
 	h.activityMu.RUnlock()
 	if fn == nil {
 		return
@@ -402,5 +412,10 @@ func (h *heartbeat) addActivity(data map[string]interface{}) {
 	data["active"] = active
 	if !last.IsZero() {
 		data["last_task_at"] = last.Unix()
+	}
+	if byQueue != nil {
+		if b, err := json.Marshal(byQueue()); err == nil {
+			data["activity"] = string(b)
+		}
 	}
 }

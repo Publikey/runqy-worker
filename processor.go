@@ -12,29 +12,32 @@ import (
 
 // processor handles dequeuing and executing tasks.
 type processor struct {
-	redis            *redisClient
-	redisMu          sync.RWMutex           // protects redis client during reconnection
-	handler          Handler                // fallback handler (ServeMux for type-based routing)
-	queueHandlers    map[string]HandlerFunc // queue name -> handler (for queue-based routing)
-	config           Config
-	queues           []string               // Unique queue names (maintenance loops)
-	order            *queueOrder            // Per-dequeue polling order (weights / strict priority)
-	queueStates      map[string]*QueueState // supervised processes per queue (may be nil)
-	subQueueToState  map[string]*QueueState // sub-queue name -> parent queue state
-	reconnector      *redisReconnector      // for connection recovery
+	redis           *redisClient
+	redisMu         sync.RWMutex           // protects redis client during reconnection
+	handler         Handler                // fallback handler (ServeMux for type-based routing)
+	queueHandlers   map[string]HandlerFunc // queue name -> handler (for queue-based routing)
+	config          Config
+	queues          []string               // Unique queue names (maintenance loops)
+	order           *queueOrder            // Per-dequeue polling order (weights / strict priority)
+	queueStates     map[string]*QueueState // supervised processes per queue (may be nil)
+	subQueueToState map[string]*QueueState // sub-queue name -> parent queue state
+	reconnector     *redisReconnector      // for connection recovery
 
-	done      chan struct{}
-	stopping  chan struct{} // closed to signal "stop dequeuing" (graceful drain)
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	logger    Logger
+	done     chan struct{}
+	stopping chan struct{} // closed to signal "stop dequeuing" (graceful drain)
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	logger   Logger
 
 	// In-flight tasks owned by this processor (taskID -> sub-queue name).
 	// Used to renew leases while processing and to requeue leftovers on shutdown.
 	inflight   map[string]string
 	inflightMu sync.Mutex
 	lastTaskAt time.Time // last time a task started or finished (guarded by inflightMu)
+	// Same clock per sub-queue (guarded by inflightMu): lets the autoscaler measure
+	// idleness on the sub-queues it watches only.
+	lastTaskByQueue map[string]time.Time
 
 	// Lease extender lifecycle.
 	leaseDone chan struct{}
@@ -56,17 +59,18 @@ func newProcessor(rdb *redisClient, handler Handler, cfg Config) *processor {
 	order := newQueueOrder(cfg.Queues, cfg.StrictPriority)
 
 	return &processor{
-		redis:         rdb,
-		handler:       handler,
-		queueHandlers: make(map[string]HandlerFunc),
-		config:        cfg,
-		queues:        order.names,
-		order:         order,
-		done:          make(chan struct{}),
-		stopping:      make(chan struct{}),
-		logger:        cfg.Logger,
-		inflight:      make(map[string]string),
-		leaseDone:     make(chan struct{}),
+		redis:           rdb,
+		handler:         handler,
+		queueHandlers:   make(map[string]HandlerFunc),
+		config:          cfg,
+		queues:          order.names,
+		order:           order,
+		done:            make(chan struct{}),
+		stopping:        make(chan struct{}),
+		logger:          cfg.Logger,
+		inflight:        make(map[string]string),
+		lastTaskByQueue: make(map[string]time.Time),
+		leaseDone:       make(chan struct{}),
 	}
 }
 
@@ -75,15 +79,28 @@ func (p *processor) trackInflight(taskID, queueName string) {
 	p.inflightMu.Lock()
 	p.inflight[taskID] = queueName
 	p.lastTaskAt = time.Now()
+	p.markQueueActivity(queueName)
 	p.inflightMu.Unlock()
 }
 
 // untrackInflight removes a task from the in-flight set.
 func (p *processor) untrackInflight(taskID string) {
 	p.inflightMu.Lock()
+	queueName, tracked := p.inflight[taskID]
 	delete(p.inflight, taskID)
 	p.lastTaskAt = time.Now()
+	if tracked {
+		p.markQueueActivity(queueName)
+	}
 	p.inflightMu.Unlock()
+}
+
+// markQueueActivity stamps the sub-queue's activity clock (inflightMu held).
+func (p *processor) markQueueActivity(queueName string) {
+	if p.lastTaskByQueue == nil {
+		p.lastTaskByQueue = make(map[string]time.Time)
+	}
+	p.lastTaskByQueue[queueName] = p.lastTaskAt
 }
 
 // snapshotInflight returns a copy of the current in-flight tasks (taskID -> queue).
@@ -103,6 +120,29 @@ func (p *processor) activity() (active int, lastTaskAt time.Time) {
 	p.inflightMu.Lock()
 	defer p.inflightMu.Unlock()
 	return len(p.inflight), p.lastTaskAt
+}
+
+// queueActivity is one sub-queue's share of the worker's activity.
+type queueActivity struct {
+	Active     int   `json:"active"`                 // in-flight tasks of this sub-queue
+	LastTaskAt int64 `json:"last_task_at,omitempty"` // unix seconds of its last task start/finish
+}
+
+// activityByQueue reports the activity per sub-queue: only those that have run a task.
+// Published in the heartbeat ("activity") for the autoscaler's idle trigger.
+func (p *processor) activityByQueue() map[string]queueActivity {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	out := make(map[string]queueActivity, len(p.lastTaskByQueue))
+	for q, t := range p.lastTaskByQueue {
+		out[q] = queueActivity{LastTaskAt: t.Unix()}
+	}
+	for _, q := range p.inflight {
+		a := out[q]
+		a.Active++
+		out[q] = a
+	}
+	return out
 }
 
 // hold stops dequeuing from the sub-queues of the given parent queues.
